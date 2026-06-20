@@ -65,5 +65,24 @@ pub enum FitsCubeError {
     Other(String),
 }
 
+/// Map the shared [`atfits_rs::AtfitsError`] into the fitscube-rs hierarchy.
+///
+/// The low-level cfitsio helpers (keyword editing, image creation, axis lookup)
+/// live in `atfits-rs`; this lets a `?` on any of them flow into a
+/// [`FitsCubeError`] with the matching variant.
+impl From<atfits_rs::AtfitsError> for FitsCubeError {
+    fn from(e: atfits_rs::AtfitsError) -> Self {
+        use atfits_rs::AtfitsError as A;
+        match e {
+            A::Fits(e) => FitsCubeError::Fits(e),
+            A::Io(e) => FitsCubeError::Io(e),
+            A::MissingKeyword(s) => FitsCubeError::MissingKeyword(s),
+            A::TargetAxisMissing(s) => FitsCubeError::TargetAxisMissing(s),
+            A::UnsupportedNaxis(n) => FitsCubeError::UnsupportedNaxis(n),
+            A::Other(s) => FitsCubeError::Other(s),
+        }
+    }
+}
+
 /// Convenience result alias.
 pub type Result<T> = std::result::Result<T, FitsCubeError>;

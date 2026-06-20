@@ -228,7 +228,7 @@ fn write_plane<T: CubeImage>(
 /// Copy only the header of a specific input HDU into a fresh primary HDU.
 fn copy_header_only_hdu(input: &Path, output: &Path, hdu_index: usize) -> Result<()> {
     if hdu_index == 0 {
-        return copy_header_only(input, output);
+        return Ok(copy_header_only(input, output)?);
     }
     // For non-primary HDUs, fall back to copying via the safe API path: open the
     // HDU, then reuse the primary-copy machinery is not applicable, so error
