@@ -112,10 +112,5 @@ jobs:
       - name: Build extension and install test dependencies
         run: uv sync --extra test
 
-      # The original `fitscube` Python package (on PyPI) is installed so the
-      # parity tests can validate fitscube-rs output against it.
-      - name: Install upstream fitscube for parity tests
-        run: uv pip install fitscube
-
       - name: Run pytest
         run: uv run --no-sync pytest -ra --durations=20

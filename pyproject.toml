@@ -19,9 +19,10 @@ Documentation = "https://fitscube-rs.readthedocs.io"
 Repository = "https://github.com/AlecThomson/fitscube-rs"
 
 [project.optional-dependencies]
-# `fitscube` is the original Python package; the parity tests run both
-# implementations on the same inputs and compare outputs.
-test = ["pytest", "numpy", "astropy", "radio-beam", "fitscube"]
+# Parity tests run both implementations on the same inputs and compare; the
+# reference `fitscube` must be >=2.3.1 (the release with the lossless
+# bounding-box fix that fitscube-rs implements).
+test = ["pytest", "numpy", "astropy", "radio-beam", "fitscube>=2.3.1"]
 dev = ["prek", "ty"]
 
 [dependency-groups]

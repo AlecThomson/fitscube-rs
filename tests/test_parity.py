@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from astropy.io import fits
+from packaging.version import Version
 
 import fitscube_rs
 
@@ -27,9 +28,10 @@ def _write_image(
     reffreq: float | None = None,
     date_obs: str | None = None,
     beam: float | None = None,
-    # The cube must exceed 1801 elements total, or the reference `fitscube`
-    # takes its (buggy) small-cube in-memory path and writes corrupt data;
-    # 30x30 planes keep us on its correct large-cube path.
+    # 30x30 planes keep the cube well above fitscube's 1801-element small-cube
+    # threshold. (Older fitscube builds corrupted data on the in-memory
+    # small-cube path; v2.3.0 fixed it, but staying large keeps the tests robust
+    # across reference versions.)
     ny: int = 30,
     nx: int = 30,
 ) -> None:
@@ -187,20 +189,10 @@ def test_time_domain_combine(tmp_path):
         assert hdul[0].header["CUNIT3"] == "s"
 
 
-def test_bounding_box_trim(tmp_path):
-    """Bounding-box trimming is a fitscube_rs-only correctness test.
-
-    The PyPI `fitscube` build's bounding box excludes the last valid row/column
-    (it omits the ``xmax += 1`` of the current source), silently dropping a row
-    and column of data. fitscube_rs follows the (fixed) source and trims
-    losslessly, so we assert the correctness property directly rather than
-    matching the older reference's off-by-one.
-    """
-    rs_dir = tmp_path / "rs"
-    rs_dir.mkdir()
-    freqs = [1.0e9, 2.0e9, 3.0e9]
-    # Valid data block: rows 5..24 (20), cols 8..21 (14); rest NaN.
-    rs_files = []
+def _make_bordered_images(d: Path, freqs) -> list[Path]:
+    """Images with a NaN border; valid block rows 5..24 (20), cols 8..21 (14)."""
+    d.mkdir(parents=True, exist_ok=True)
+    files = []
     for i, freq in enumerate(freqs):
         data = np.full((30, 30), np.nan, dtype=np.float32)
         data[5:25, 8:22] = float(i + 1)
@@ -214,24 +206,54 @@ def test_bounding_box_trim(tmp_path):
         h["CDELT1"] = -1.0 / 3600.0
         h["CDELT2"] = 1.0 / 3600.0
         h["REFFREQ"] = freq
-        p = rs_dir / f"b_{i}.fits"
+        p = d / f"b_{i}.fits"
         fits.writeto(p, data, h, overwrite=True)
-        rs_files.append(p)
+        files.append(p)
+    return files
 
+
+# The lossless bounding box (keeping the last valid row/col) landed after the
+# v2.3.0 tag (fitscube PR #51). Released v2.3.0 has an off-by-one that drops a
+# row and column of real data. fitscube_rs implements the correct, lossless
+# behaviour, so the cross-check against fitscube only holds from that fix on.
+_BBOX_FIX_VERSION = Version("2.3.1")
+_fitscube_has_bbox_fix = Version(fitscube.__version__.split("+")[0].split(".dev")[0]) >= (
+    _BBOX_FIX_VERSION
+)
+
+
+def test_bounding_box_trim(tmp_path):
+    freqs = [1.0e9, 2.0e9, 3.0e9]
+    rs_files = _make_bordered_images(tmp_path / "rs", freqs)
     rs_cube = tmp_path / "rs_cube.fits"
     fitscube_rs.combine_fits(
         [str(f) for f in rs_files], str(rs_cube), overwrite=True, bounding_box=True
     )
 
+    # Correctness (always): fitscube_rs trims losslessly to the full valid block.
     with fits.open(rs_cube) as hdul:
-        # Trimmed losslessly to the full valid block.
         assert hdul[0].data.shape == (3, 20, 14)
-        # Reference pixel shifted by the trim origin (CRPIX1 -= ymin=8, CRPIX2 -= xmin=5).
-        assert hdul[0].header["CRPIX1"] == pytest.approx(1.0 - 8.0)
-        assert hdul[0].header["CRPIX2"] == pytest.approx(1.0 - 5.0)
-        # Every channel retains its constant fill, no NaNs introduced.
+        assert hdul[0].header["CRPIX1"] == pytest.approx(1.0 - 8.0)  # -= ymin
+        assert hdul[0].header["CRPIX2"] == pytest.approx(1.0 - 5.0)  # -= xmin
         for c in range(3):
             np.testing.assert_allclose(hdul[0].data[c], float(c + 1))
+
+    # Parity (only when the reference carries the lossless fix, i.e. > v2.3.0).
+    if not _fitscube_has_bbox_fix:
+        pytest.skip(
+            f"fitscube {fitscube.__version__} predates the lossless bounding-box "
+            f"fix (>= {_BBOX_FIX_VERSION}); skipping cross-check"
+        )
+    ref_files = _make_bordered_images(tmp_path / "ref", freqs)
+    ref_cube = tmp_path / "ref_cube.fits"
+    fitscube.combine_fits(file_list=ref_files, out_cube=ref_cube, overwrite=True, bounding_box=True)
+    with fits.open(ref_cube) as ref_hdul, fits.open(rs_cube) as rs_hdul:
+        assert rs_hdul[0].data.shape == ref_hdul[0].data.shape
+        for card in ("NAXIS1", "NAXIS2", "CRPIX1", "CRPIX2"):
+            assert rs_hdul[0].header[card] == pytest.approx(ref_hdul[0].header[card]), card
+        np.testing.assert_allclose(
+            np.nan_to_num(rs_hdul[0].data), np.nan_to_num(ref_hdul[0].data), rtol=1e-6
+        )
 
 
 def test_extract_matches_input_plane(tmp_path):
