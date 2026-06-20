@@ -94,9 +94,9 @@ def _compare_cubes(ref: Path, rs: Path) -> None:
                 if isinstance(ref_h[card], str):
                     assert rs_h[card] == ref_h[card], card
                 else:
-                    assert rs_h[card] == pytest.approx(ref_h[card], rel=1e-9, abs=1e-3), (
-                        f"{card}: {rs_h[card]} != {ref_h[card]}"
-                    )
+                    assert rs_h[card] == pytest.approx(
+                        ref_h[card], rel=1e-9, abs=1e-3
+                    ), f"{card}: {rs_h[card]} != {ref_h[card]}"
 
 
 def test_even_frequency_combine(tmp_path):
@@ -151,7 +151,9 @@ def test_varying_beams_beam_table(tmp_path):
         ref_beams = ref_hdul["BEAMS"].data
         rs_beams = rs_hdul["BEAMS"].data
         for col in ("BMAJ", "BMIN", "BPA"):
-            np.testing.assert_allclose(rs_beams[col], ref_beams[col], rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(
+                rs_beams[col], ref_beams[col], rtol=1e-4, atol=1e-4
+            )
 
 
 def test_time_domain_combine(tmp_path):
@@ -178,7 +180,9 @@ def test_time_domain_combine(tmp_path):
     ref_cube = tmp_path / "ref_cube.fits"
     rs_cube = tmp_path / "rs_cube.fits"
 
-    fitscube.combine_fits(file_list=ref_files, out_cube=ref_cube, overwrite=True, time_domain_mode=True)
+    fitscube.combine_fits(
+        file_list=ref_files, out_cube=ref_cube, overwrite=True, time_domain_mode=True
+    )
     fitscube_rs.combine_fits(
         [str(f) for f in rs_files], str(rs_cube), overwrite=True, time_domain_mode=True
     )
@@ -217,9 +221,9 @@ def _make_bordered_images(d: Path, freqs) -> list[Path]:
 # row and column of real data. fitscube_rs implements the correct, lossless
 # behaviour, so the cross-check against fitscube only holds from that fix on.
 _BBOX_FIX_VERSION = Version("2.3.1")
-_fitscube_has_bbox_fix = Version(fitscube.__version__.split("+")[0].split(".dev")[0]) >= (
-    _BBOX_FIX_VERSION
-)
+_fitscube_has_bbox_fix = Version(
+    fitscube.__version__.split("+")[0].split(".dev")[0]
+) >= (_BBOX_FIX_VERSION)
 
 
 def test_bounding_box_trim(tmp_path):
@@ -246,11 +250,15 @@ def test_bounding_box_trim(tmp_path):
         )
     ref_files = _make_bordered_images(tmp_path / "ref", freqs)
     ref_cube = tmp_path / "ref_cube.fits"
-    fitscube.combine_fits(file_list=ref_files, out_cube=ref_cube, overwrite=True, bounding_box=True)
+    fitscube.combine_fits(
+        file_list=ref_files, out_cube=ref_cube, overwrite=True, bounding_box=True
+    )
     with fits.open(ref_cube) as ref_hdul, fits.open(rs_cube) as rs_hdul:
         assert rs_hdul[0].data.shape == ref_hdul[0].data.shape
         for card in ("NAXIS1", "NAXIS2", "CRPIX1", "CRPIX2"):
-            assert rs_hdul[0].header[card] == pytest.approx(ref_hdul[0].header[card]), card
+            assert rs_hdul[0].header[card] == pytest.approx(ref_hdul[0].header[card]), (
+                card
+            )
         np.testing.assert_allclose(
             np.nan_to_num(rs_hdul[0].data), np.nan_to_num(ref_hdul[0].data), rtol=1e-6
         )
@@ -262,7 +270,9 @@ def test_extract_matches_input_plane(tmp_path):
     cube = tmp_path / "cube.fits"
     fitscube_rs.combine_fits([str(f) for f in rs_files], str(cube), overwrite=True)
 
-    out = fitscube_rs.extract_plane_from_cube(str(cube), channel_index=2, overwrite=True)
+    out = fitscube_rs.extract_plane_from_cube(
+        str(cube), channel_index=2, overwrite=True
+    )
     with fits.open(out) as hdul:
         data = np.squeeze(hdul[0].data)
         # Channel 2 was filled with value 3.0 (fill = i + 1).

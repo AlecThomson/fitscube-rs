@@ -16,10 +16,10 @@ import tempfile
 import time
 from pathlib import Path
 
+import fitscube  # the reference implementation
 import numpy as np
 from astropy.io import fits
 
-import fitscube  # the reference implementation
 import fitscube_rs
 
 
@@ -88,12 +88,16 @@ def run_benchmark(nchan: int, size: int, repeat: int) -> dict[str, float]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--nchan", type=int, default=100, help="Number of channels")
-    parser.add_argument("--size", type=int, default=256, help="Image edge length (pixels)")
+    parser.add_argument(
+        "--size", type=int, default=256, help="Image edge length (pixels)"
+    )
     parser.add_argument("--repeat", type=int, default=3, help="Best-of-N timing runs")
     args = parser.parse_args()
 
     cube_mb = args.nchan * args.size * args.size * 4 / 1e6
-    print(f"Combining {args.nchan} x {args.size}x{args.size} images (~{cube_mb:.0f} MB cube)")
+    print(
+        f"Combining {args.nchan} x {args.size}x{args.size} images (~{cube_mb:.0f} MB cube)"
+    )
     print(f"best of {args.repeat} run(s)\n")
 
     times = run_benchmark(args.nchan, args.size, args.repeat)

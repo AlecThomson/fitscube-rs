@@ -6,9 +6,9 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
+use fitscube_rs::fits_io::{CubeElem, create_cube_open};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
-use fitscube_rs::fits_io::{CubeElem, create_cube_open};
 
 const NCHAN: usize = 400;
 const SIZE: usize = 512;
