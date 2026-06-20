@@ -44,15 +44,15 @@ sorted(p.name for p in paths)
 
 ## Combining images into a cube
 
-{func}`~fitscube_rs.combine` stacks the per-channel images along a new spectral
-(or time) axis, building the WCS for that axis from the per-image headers. The
-resulting cube is written to disk:
+{func}`~fitscube_rs.combine_fits` stacks the per-channel images along a new
+spectral (or time) axis, building the WCS for that axis from the per-image
+headers. The resulting cube is written to disk:
 
 ```{code-cell} ipython3
-from fitscube_rs import combine
+from fitscube_rs import combine_fits
 
 out_cube = workdir / "cube.fits"
-freqs = combine(
+freqs = combine_fits(
     [str(p) for p in sorted(paths)],
     str(out_cube),
     overwrite=True,
@@ -70,15 +70,17 @@ instead writes an explicit per-plane frequency table so no information is lost
 
 ## Extracting a plane
 
-{func}`~fitscube_rs.extract` pulls a single plane back out of a cube — the
-inverse of combining — which is handy for inspecting one channel or feeding a
-downstream tool that expects a 2D image:
+{func}`~fitscube_rs.extract_plane_from_cube` pulls a single plane back out of a
+cube — the inverse of combining — which is handy for inspecting one channel or
+feeding a downstream tool that expects a 2D image:
 
 ```{code-cell} ipython3
-from fitscube_rs import extract
+from fitscube_rs import extract_plane_from_cube
 
 plane_path = workdir / "chan2.fits"
-extract(str(out_cube), channel_index=2, output_path=str(plane_path), overwrite=True)
+extract_plane_from_cube(
+    str(out_cube), channel_index=2, output_path=str(plane_path), overwrite=True
+)
 
 with fits.open(plane_path) as hdul:
     print("plane shape:", hdul[0].data.shape)
