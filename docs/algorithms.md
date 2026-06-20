@@ -74,10 +74,11 @@ pixels as blank, so zero-padded borders are trimmed too.
 
 ## Floating-point precision
 
-`--floating {16,32,64}` selects the pixel data type of the output cube
-(`float16`, `float32`, or `float64`). The default follows the inputs;
-downcasting is offered for cubes where storage matters more than the last bits
-of precision.
+`--floating {32,64}` selects the pixel data type of the output cube
+(`float32` / BITPIX −32, or `float64` / BITPIX −64). These are the only IEEE
+float widths the FITS standard defines, so other values are rejected. The
+default follows the inputs; downcasting to `float32` is offered for cubes where
+storage matters more than the last bits of precision.
 
 ## Plane extraction
 
