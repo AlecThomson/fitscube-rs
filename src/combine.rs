@@ -2,9 +2,12 @@
 //!
 //! Port of `fitscube.combine_fits`. The pipeline: parse the spectral/temporal
 //! axis ([`crate::specs`]), read beams ([`crate::beams`]), sort the inputs,
-//! optionally compute a common bounding box, write a correctly-shaped blank
-//! output cube, then stream each plane into it (reading/decoding in parallel,
-//! writing on a single thread because cfitsio is not thread-safe).
+//! optionally compute a common bounding box, build the output header, then
+//! stream each plane into the cube with raw I/O (reading/decoding in parallel,
+//! writing on a single thread). The data unit bypasses cfitsio entirely to avoid
+//! its zero-fill pass — see [`mem_header`] and [`write_cube_raw`].
+use std::fs::OpenOptions;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
@@ -16,10 +19,44 @@ use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, create_bound_box_plane, extract_common_bounding_box};
 use crate::error::{FitsCubeError, Result};
 use crate::fits_io::{
-    CubeElem, HeaderGeom, PixelType, create_cube_open, delete_key, find_target_axis, has_key,
-    update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
+    CubeElem, CubeLayout, HeaderGeom, PixelType, create_mem_cube, delete_key,
+    extract_header_layout, find_target_axis, has_key, update_key_f64, update_key_i64,
+    update_key_logical, update_key_str, write_comment,
 };
 use crate::specs::parse_specs;
+
+/// FITS records are 2880 bytes; headers and the data unit are each padded up to
+/// a whole number of these blocks.
+const FITS_BLOCK: u64 = 2880;
+
+fn round_up_to_block(n: u64) -> u64 {
+    n.div_ceil(FITS_BLOCK) * FITS_BLOCK
+}
+
+/// A pixel value serialisable to big-endian FITS byte order.
+///
+/// The combine writer bypasses cfitsio for the data unit (see [`write_cube_raw`]),
+/// so it byte-swaps each plane itself — exactly as the Python reference does with
+/// `ndarray.astype(">f4")` before a raw `tofile`.
+trait BeBytes: Copy {
+    /// On-disk width in bytes (FITS `|BITPIX|/8`).
+    const WIDTH: usize;
+    fn extend_be(self, buf: &mut Vec<u8>);
+}
+
+impl BeBytes for f32 {
+    const WIDTH: usize = 4;
+    fn extend_be(self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_bits().to_be_bytes());
+    }
+}
+
+impl BeBytes for f64 {
+    const WIDTH: usize = 8;
+    fn extend_be(self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.to_bits().to_be_bytes());
+    }
+}
 
 /// Options for [`combine_fits`], mirroring the keyword arguments of the Python
 /// `combine_fits`.
@@ -126,7 +163,9 @@ struct InitResult {
     plane_len: usize,
 }
 
-/// Write a correctly-shaped, zero-filled output cube with a complete header.
+/// Build the complete primary header for the output cube and return its on-disk
+/// byte layout ([`CubeLayout`]) — no data unit is written here (see
+/// [`crate::mem_header`]).
 #[allow(clippy::too_many_arguments)]
 fn create_output_cube(
     template: &Path,
@@ -139,7 +178,7 @@ fn create_output_cube(
     time_domain_mode: bool,
     bbox: Option<&BoundingBox>,
     float_length: Option<u8>,
-) -> Result<(InitResult, FitsFile)> {
+) -> Result<(InitResult, CubeLayout)> {
     if out_cube.exists() && !overwrite {
         return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));
     }
@@ -199,13 +238,12 @@ fn create_output_cube(
     let has_cd = has_key(template, "CD1_1")?;
     let has_pc = has_key(template, "PC1_1")?;
 
-    // Initialise on disk: create the output at its final shape/BITPIX and copy
-    // the template's WCS cards. The handle is kept OPEN and returned — the caller
-    // streams every plane into it and closes it once, so cfitsio writes the data
-    // unit a single time. (Creating-then-closing here, or copy+resize, would
-    // flush a full pass of zeros that every plane then overwrites — doubling the
-    // I/O for large cubes.)
-    let mut fptr = create_cube_open(template, out_cube, out_bitpix, &dims)?;
+    // Build the header in memory (no disk, so cfitsio never zero-fills the data
+    // unit) at its final shape/BITPIX, copying the template's WCS cards. The
+    // caller writes the header bytes and streams planes with raw I/O, so the data
+    // unit is written exactly once and its untouched tail stays sparse — see
+    // [`crate::mem_header`] and [`write_cube_raw`].
+    let mut fptr = create_mem_cube(template, out_bitpix, &dims)?;
 
     // Spectral/temporal axis cards.
     update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
@@ -263,12 +301,13 @@ fn create_output_cube(
     }
 
     let plane_len = dims[0] * dims.get(1).copied().unwrap_or(1);
+    let layout = extract_header_layout(&mut fptr)?;
     Ok((
         InitResult {
             pixel_type: PixelType::from_bitpix(out_bitpix),
             plane_len,
         },
-        fptr,
+        layout,
     ))
 }
 
@@ -316,14 +355,21 @@ fn process_plane<T: CubeElem + num_traits::Float>(
     Ok(plane)
 }
 
-/// Stream all channels into the initialised output cube.
+/// Stream all channels into the output cube using raw I/O.
 ///
-/// `fptr` is the still-open output handle from [`create_output_cube`]; it is
-/// moved into the single writer thread and closed once at the end, so cfitsio
-/// flushes the data unit exactly once (written planes cover it, avoiding a
-/// wasted zero-fill pass).
-fn write_channels<T: CubeElem + num_traits::Float>(
-    mut fptr: FitsFile,
+/// Bypasses cfitsio for the data unit: the file is created with the prebuilt
+/// header ([`CubeLayout`]) and sparsely extended to its final length, then each
+/// decoded plane is byte-swapped to big-endian ([`BeBytes`]) and written at its
+/// offset. This mirrors the Python reference (`astype(">f4")` + raw `tofile`),
+/// which is markedly faster than cfitsio's per-block write path and never pays
+/// the zero-fill pass cfitsio does on close.
+///
+/// Planes are decoded by the rayon pool (parallel readers) and written on this
+/// single thread; `write_all_at` is positional, so out-of-order arrival is fine.
+#[allow(clippy::too_many_arguments)]
+fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
+    out_cube: &Path,
+    layout: &CubeLayout,
     file_list: &[PathBuf],
     new_to_old: &[Option<usize>],
     plane_len: usize,
@@ -331,42 +377,56 @@ fn write_channels<T: CubeElem + num_traits::Float>(
     invalidate_zeros: bool,
     max_workers: Option<usize>,
 ) -> Result<()> {
+    let n_chan = new_to_old.len();
+    let plane_bytes = (plane_len * T::WIDTH) as u64;
+
+    // Lay down the header and size the file. `set_len` past the header leaves the
+    // data unit (and its 2880-padded tail) sparse — zero-backed on demand — so no
+    // zeros are physically written; the planes below cover the real data.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out_cube)?;
+    file.write_all_at(&layout.header, 0)?;
+    let data_len = plane_bytes * n_chan as u64;
+    file.set_len(layout.datastart + round_up_to_block(data_len))?;
+
     // Buffer enough decoded planes that the parallel readers stay ahead of the
-    // single (serial) cfitsio writer instead of blocking on a tiny queue.
+    // single (serial) writer instead of blocking on a tiny queue.
     let default_bound = std::thread::available_parallelism()
         .map(|n| n.get() * 2)
         .unwrap_or(8);
     let bound = max_workers.unwrap_or(default_bound).max(1);
     let (tx, rx) = sync_channel::<(usize, Vec<T>)>(bound);
 
-    // cfitsio's handle is not `Send`, so the writer stays on this thread; the
-    // parallel readers run in a spawned producer thread (rayon pool) and stream
-    // decoded planes back over the channel.
     std::thread::scope(|scope| -> Result<()> {
         let producer = scope.spawn(move || -> Result<()> {
-            let res =
-                (0..new_to_old.len())
-                    .into_par_iter()
-                    .try_for_each(|new_chan| -> Result<()> {
-                        let plane = match new_to_old[new_chan] {
-                            Some(old) => {
-                                process_plane::<T>(&file_list[old], bbox, invalidate_zeros)?
-                            }
-                            None => vec![T::nan(); plane_len], // missing → blank plane
-                        };
-                        tx.send((new_chan, plane)).map_err(|e| {
-                            FitsCubeError::Other(format!("channel send failed: {e}"))
-                        })?;
-                        Ok(())
-                    });
+            let res = (0..n_chan)
+                .into_par_iter()
+                .try_for_each(|new_chan| -> Result<()> {
+                    let plane = match new_to_old[new_chan] {
+                        Some(old) => process_plane::<T>(&file_list[old], bbox, invalidate_zeros)?,
+                        None => vec![T::nan(); plane_len], // missing → blank plane
+                    };
+                    tx.send((new_chan, plane))
+                        .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
+                    Ok(())
+                });
             drop(tx); // close the channel so the writer loop below ends
             res
         });
 
-        // Writer (this thread): consume planes and write them via cfitsio.
+        // Writer (this thread): byte-swap each plane and write it at its offset.
+        let mut buf: Vec<u8> = Vec::with_capacity(plane_bytes as usize);
         for (chan, data) in rx {
-            let start = chan * plane_len;
-            T::write_section(&mut fptr, start, start + data.len(), &data)?;
+            buf.clear();
+            for v in &data {
+                v.extend_be(&mut buf);
+            }
+            let offset = layout.datastart + chan as u64 * plane_bytes;
+            file.write_all_at(&buf, offset)?;
         }
 
         producer
@@ -435,8 +495,8 @@ pub fn combine_fits(
         None
     };
 
-    // Initialise output cube (returns the open handle for the writer).
-    let (init, out_fptr) = create_output_cube(
+    // Build the output header (in memory) and its on-disk byte layout.
+    let (init, layout) = create_output_cube(
         &sorted_files[0],
         out_cube,
         &specs,
@@ -470,8 +530,9 @@ pub fn combine_fits(
 
     // Stream planes in the output precision.
     match init.pixel_type {
-        PixelType::F32 => write_channels::<f32>(
-            out_fptr,
+        PixelType::F32 => write_cube_raw::<f32>(
+            out_cube,
+            &layout,
             &sorted_files,
             &new_to_old,
             init.plane_len,
@@ -479,8 +540,9 @@ pub fn combine_fits(
             options.invalidate_zeros,
             options.max_workers,
         )?,
-        PixelType::F64 => write_channels::<f64>(
-            out_fptr,
+        PixelType::F64 => write_cube_raw::<f64>(
+            out_cube,
+            &layout,
             &sorted_files,
             &new_to_old,
             init.plane_len,
