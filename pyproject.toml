@@ -95,6 +95,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Tests deliberately assert on broad ValueError raised from the Rust layer.
 "tests/**" = ["PT011"]
+# The benchmark is a standalone CLI script; printing its report is the point.
+"scripts/**" = ["T201"]
 
 [tool.maturin]
 features = ["python"]

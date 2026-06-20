@@ -8,7 +8,7 @@ bug in `fitscube_rs`.
 
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -16,6 +16,9 @@ from astropy.io import fits
 from packaging.version import Version
 
 import fitscube_rs
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 # The reference implementation. Skip the whole module if it is not installed.
 fitscube = pytest.importorskip("fitscube")
