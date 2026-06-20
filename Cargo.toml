@@ -1,6 +1,69 @@
 [package]
 name = "fitscube-rs"
-version = "0.1.0"
+# Placeholder: the real version is the git tag, injected at release time by the
+# CD workflow via `cargo set-version`. maturin reads this value, so the Python
+# wheel/sdist version follows automatically.
+version = "0.0.0"
 edition = "2024"
+authors = ["Alec Thomson"]
+license = "BSD-3-Clause"
+description = "Combine single-frequency/single-time FITS images into a FITS cube (Rust port of fitscube)"
+repository = "https://github.com/AlecThomson/fitscube-rs"
+documentation = "https://docs.rs/fitscube-rs"
+readme = "README.md"
+
+[package.metadata.docs.rs]
+# docs.rs runs build scripts on a read-only source tree, so the default
+# `fitsio-src` feature (cfitsio compiled from source) fails there. Its build
+# image ships libcfitsio-dev, so link the system library instead. The optional
+# `python`/`abi3` features need a Python toolchain and add nothing to the Rust
+# API docs.
+no-default-features = true
+features = []
+
+[lib]
+name = "fitscube_rs"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "fitscube"
+path = "src/main.rs"
+
+[features]
+# Build cfitsio from source (needs only a C compiler), so no system cfitsio is
+# required in CI or when building wheels. On by default; disable
+# (--no-default-features) to link a system cfitsio instead, as docs.rs does.
+default = ["fitsio-src"]
+fitsio-src = ["fitsio/fitsio-src"]
+python = ["dep:pyo3", "dep:numpy"]
+# Stable-ABI build for distributable wheels: maturin builds a single
+# `cp310-abi3` wheel per platform (works on Python >=3.10) and can build
+# without a Python interpreter present, which cross-compiled (e.g. aarch64)
+# wheels require. Mutually exclusive with `stubgen`.
+abi3 = ["python", "pyo3/abi3-py310"]
+# Regenerate the .pyi type stubs (dev only). Do NOT combine with `abi3`.
+stubgen = ["python", "dep:pyo3-stub-gen"]
 
 [dependencies]
+pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
+numpy = { version = "0.26", optional = true }
+pyo3-stub-gen = { version = "0.22.3", optional = true }
+# cfitsio linkage is controlled by the crate-level `fitsio-src` feature (see
+# [features] above).
+fitsio = { version = "0.21" }
+ndarray = "0.16"
+num-traits = "0.2"
+rayon = "1"
+# DATE-OBS (ISO-8601) -> MJD seconds, matching astropy Time(..., format="isot").mjd.
+hifitime = "4"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+indicatif = { version = "0.17", features = ["rayon"] }
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3"
