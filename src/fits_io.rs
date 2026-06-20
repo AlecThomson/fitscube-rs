@@ -324,6 +324,109 @@ pub fn resize_image(fptr: &mut FitsFile, bitpix: i64, dims: &[usize]) -> Result<
     Ok(())
 }
 
+/// Keywords that describe the on-disk array structure; these are set by
+/// `fits_create_img` for the new cube and must NOT be copied from the template.
+fn is_structural_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "SIMPLE"
+            | "BITPIX"
+            | "NAXIS"
+            | "EXTEND"
+            | "PCOUNT"
+            | "GCOUNT"
+            | "END"
+            | "BSCALE"
+            | "BZERO"
+            | "BLANK"
+    ) || (name.starts_with("NAXIS") && name[5..].chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Map a FITS `BITPIX` to the `fitsio` image element type.
+fn bitpix_to_image_type(bitpix: i64) -> fitsio::images::ImageType {
+    use fitsio::images::ImageType;
+    match bitpix {
+        8 => ImageType::UnsignedByte,
+        16 => ImageType::Short,
+        32 => ImageType::Long,
+        64 => ImageType::LongLong,
+        -64 => ImageType::Double,
+        _ => ImageType::Float, // -32 and anything unexpected
+    }
+}
+
+/// Create `output` as a fresh image of shape `dims` (FITS order, NAXIS1 first)
+/// and `bitpix`, copy every non-structural header card from `input`, and return
+/// the **open** handle.
+///
+/// Keeping the handle open is the key to performance: cfitsio writes the (large)
+/// data unit to disk only when the file is closed, so if the caller streams all
+/// planes into this handle before closing, the data is written exactly once.
+/// `copy_header_only` + [`resize_image`] instead closes after resizing, forcing
+/// cfitsio to write a full pass of zeros that every plane then overwrites —
+/// doubling the I/O for big cubes.
+pub fn create_cube_open(
+    input: &Path,
+    output: &Path,
+    bitpix: i64,
+    dims: &[usize],
+) -> Result<FitsFile> {
+    use fitsio::images::ImageDescription;
+
+    if let (Ok(in_canon), Ok(out_canon)) = (input.canonicalize(), output.canonicalize())
+        && in_canon == out_canon
+    {
+        return Err(FitsCubeError::Other(format!(
+            "output {} resolves to the input image",
+            output.display()
+        )));
+    }
+    if output.exists() {
+        std::fs::remove_file(output)?;
+    }
+
+    // `ImageDescription::dimensions` is C-order (row-major), the reverse of the
+    // FITS NAXIS order.
+    let c_dims: Vec<usize> = dims.iter().rev().copied().collect();
+    let desc = ImageDescription {
+        data_type: bitpix_to_image_type(bitpix),
+        dimensions: &c_dims,
+    };
+    let mut out = FitsFile::create(output)
+        .with_custom_primary(&desc)
+        .overwrite()
+        .open()?;
+    out.primary_hdu()?;
+
+    // Copy every non-structural card from the template's primary header.
+    let mut in_fptr = FitsFile::open(input.to_string_lossy().as_ref())?;
+    in_fptr.primary_hdu()?;
+    let mut status = 0;
+    unsafe {
+        let mut nkeys: std::os::raw::c_int = 0;
+        let mut morekeys: std::os::raw::c_int = 0;
+        fitsio::sys::ffghsp(in_fptr.as_raw(), &mut nkeys, &mut morekeys, &mut status);
+        check_status(status)?;
+
+        let mut card = [0i8; 81];
+        for i in 1..=nkeys {
+            card.fill(0);
+            fitsio::sys::ffgrec(in_fptr.as_raw(), i, card.as_mut_ptr(), &mut status);
+            if check_status(status).is_err() {
+                break;
+            }
+            let card_str = std::ffi::CStr::from_ptr(card.as_ptr()).to_string_lossy();
+            let name = card_str.split([' ', '=']).next().unwrap_or("").trim();
+            if is_structural_keyword(name) {
+                continue;
+            }
+            fitsio::sys::ffprec(out.as_raw(), card.as_ptr(), &mut status);
+            check_status(status)?;
+        }
+    }
+    Ok(out)
+}
+
 /// Create `output` containing only the primary-HDU header of `input` — no pixel
 /// data read or copied.
 ///

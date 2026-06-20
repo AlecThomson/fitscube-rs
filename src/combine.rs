@@ -16,9 +16,8 @@ use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, create_bound_box_plane, extract_common_bounding_box};
 use crate::error::{FitsCubeError, Result};
 use crate::fits_io::{
-    CubeElem, HeaderGeom, PixelType, copy_header_only, delete_key, find_target_axis, has_key,
-    read_key_f64, resize_image, update_key_f64, update_key_i64, update_key_logical, update_key_str,
-    write_comment,
+    CubeElem, HeaderGeom, PixelType, create_cube_open, delete_key, find_target_axis, has_key,
+    update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
 };
 use crate::specs::parse_specs;
 
@@ -140,7 +139,7 @@ fn create_output_cube(
     time_domain_mode: bool,
     bbox: Option<&BoundingBox>,
     float_length: Option<u8>,
-) -> Result<InitResult> {
+) -> Result<(InitResult, FitsFile)> {
     if out_cube.exists() && !overwrite {
         return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));
     }
@@ -200,74 +199,77 @@ fn create_output_cube(
     let has_cd = has_key(template, "CD1_1")?;
     let has_pc = has_key(template, "PC1_1")?;
 
-    // Initialise on disk: copy the template header (no pixel data), then resize
-    // the image to the cube shape and BITPIX (preserves all other WCS cards).
-    copy_header_only(template, out_cube)?;
-    {
-        let mut fptr = FitsFile::edit(out_cube.to_string_lossy().as_ref())?;
-        fptr.primary_hdu()?;
-        resize_image(&mut fptr, out_bitpix, &dims)?;
+    // Initialise on disk: create the output at its final shape/BITPIX and copy
+    // the template's WCS cards. The handle is kept OPEN and returned — the caller
+    // streams every plane into it and closes it once, so cfitsio writes the data
+    // unit a single time. (Creating-then-closing here, or copy+resize, would
+    // flush a full pass of zeros that every plane then overwrites — doubling the
+    // I/O for large cubes.)
+    let mut fptr = create_cube_open(template, out_cube, out_bitpix, &dims)?;
 
-        // Spectral/temporal axis cards.
-        update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
-        update_key_f64(&mut fptr, &format!("CRVAL{fi}"), specs[0])?;
-        let cdelt = if n_chan > 1 {
-            let diffs: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
-            median(&diffs)
-        } else {
-            1.0
-        };
-        update_key_f64(&mut fptr, &format!("CDELT{fi}"), cdelt)?;
-        update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
-        update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
+    // Spectral/temporal axis cards.
+    update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
+    update_key_f64(&mut fptr, &format!("CRVAL{fi}"), specs[0])?;
+    let cdelt = if n_chan > 1 {
+        let diffs: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
+        median(&diffs)
+    } else {
+        1.0
+    };
+    update_key_f64(&mut fptr, &format!("CDELT{fi}"), cdelt)?;
+    update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
+    update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
 
-        // Diagonal transform term for the new axis, for consistency.
-        if (has_cd || has_pc) && fi != 1 {
-            let kind = if has_cd { "CD" } else { "PC" };
-            update_key_f64(&mut fptr, &format!("{kind}{fi}_{fi}"), 1.0)?;
-        }
+    // Diagonal transform term for the new axis, for consistency.
+    if (has_cd || has_pc) && fi != 1 {
+        let kind = if has_cd { "CD" } else { "PC" };
+        update_key_f64(&mut fptr, &format!("{kind}{fi}_{fi}"), 1.0)?;
+    }
 
-        // Unevenly spaced or ignored ⇒ encode a plain channel index.
-        if ignore_spec || !even_spec {
-            update_key_f64(&mut fptr, &format!("CDELT{fi}"), 1.0)?;
-            delete_key(&mut fptr, &format!("CUNIT{fi}"))?;
-            update_key_str(&mut fptr, &format!("CTYPE{fi}"), "CHAN")?;
-            update_key_f64(&mut fptr, &format!("CRVAL{fi}"), 1.0)?;
-        }
+    // Unevenly spaced or ignored ⇒ encode a plain channel index.
+    if ignore_spec || !even_spec {
+        update_key_f64(&mut fptr, &format!("CDELT{fi}"), 1.0)?;
+        delete_key(&mut fptr, &format!("CUNIT{fi}"))?;
+        update_key_str(&mut fptr, &format!("CTYPE{fi}"), "CHAN")?;
+        update_key_f64(&mut fptr, &format!("CRVAL{fi}"), 1.0)?;
+    }
 
-        // Varying beams ⇒ drop the single-beam keywords; the BEAMS table holds
-        // the per-channel values.
-        if has_beams && !single_beam {
-            let tiny = f32::MIN_POSITIVE;
-            update_key_logical(&mut fptr, "CASAMBM", true)?;
-            write_comment(&mut fptr, "The PSF in each image plane varies.")?;
-            write_comment(
-                &mut fptr,
-                "Full beam information is stored in the second FITS extension.",
-            )?;
-            write_comment(
-                &mut fptr,
-                &format!("The value '{tiny}' repsenents a NaN PSF in the beamtable."),
-            )?;
-            delete_key(&mut fptr, "BMAJ")?;
-            delete_key(&mut fptr, "BMIN")?;
-            delete_key(&mut fptr, "BPA")?;
-        }
+    // Varying beams ⇒ drop the single-beam keywords; the BEAMS table holds
+    // the per-channel values.
+    if has_beams && !single_beam {
+        let tiny = f32::MIN_POSITIVE;
+        update_key_logical(&mut fptr, "CASAMBM", true)?;
+        write_comment(&mut fptr, "The PSF in each image plane varies.")?;
+        write_comment(
+            &mut fptr,
+            "Full beam information is stored in the second FITS extension.",
+        )?;
+        write_comment(
+            &mut fptr,
+            &format!("The value '{tiny}' repsenents a NaN PSF in the beamtable."),
+        )?;
+        delete_key(&mut fptr, "BMAJ")?;
+        delete_key(&mut fptr, "BMIN")?;
+        delete_key(&mut fptr, "BPA")?;
+    }
 
-        // Bounding box shifts the spatial reference pixel.
-        if let Some(bb) = bbox {
-            let crpix1 = read_key_f64(out_cube, "CRPIX1")?.unwrap_or(1.0);
-            let crpix2 = read_key_f64(out_cube, "CRPIX2")?.unwrap_or(1.0);
-            update_key_f64(&mut fptr, "CRPIX1", crpix1 - bb.ymin as f64)?;
-            update_key_f64(&mut fptr, "CRPIX2", crpix2 - bb.xmin as f64)?;
-        }
+    // Bounding box shifts the spatial reference pixel.
+    if let Some(bb) = bbox {
+        let hdu = fptr.primary_hdu()?;
+        let crpix1: f64 = hdu.read_key(&mut fptr, "CRPIX1").unwrap_or(1.0);
+        let crpix2: f64 = hdu.read_key(&mut fptr, "CRPIX2").unwrap_or(1.0);
+        update_key_f64(&mut fptr, "CRPIX1", crpix1 - bb.ymin as f64)?;
+        update_key_f64(&mut fptr, "CRPIX2", crpix2 - bb.xmin as f64)?;
     }
 
     let plane_len = dims[0] * dims.get(1).copied().unwrap_or(1);
-    Ok(InitResult {
-        pixel_type: PixelType::from_bitpix(out_bitpix),
-        plane_len,
-    })
+    Ok((
+        InitResult {
+            pixel_type: PixelType::from_bitpix(out_bitpix),
+            plane_len,
+        },
+        fptr,
+    ))
 }
 
 /// Read one input plane as type `T`, apply bounding box / zero-invalidation, and
@@ -277,14 +279,22 @@ fn process_plane<T: CubeElem + num_traits::Float>(
     bbox: Option<&BoundingBox>,
     invalidate_zeros: bool,
 ) -> Result<Vec<T>> {
+    // Single open per plane. Only read the spatial dims (extra header keys) when
+    // a bounding box actually needs them.
     let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let geom = HeaderGeom::read(path)?;
-    // FITS order dims[0]=NAXIS1 (cols), dims[1]=NAXIS2 (rows).
-    let ncols = geom.dims.first().copied().unwrap_or(1);
-    let nrows = geom.dims.get(1).copied().unwrap_or(1);
+    let dims = if bbox.is_some() {
+        let hdu = fptr.primary_hdu()?;
+        // FITS order: NAXIS1 = cols (fast), NAXIS2 = rows.
+        let ncols: i64 = hdu.read_key(&mut fptr, "NAXIS1")?;
+        let nrows: i64 = hdu.read_key(&mut fptr, "NAXIS2")?;
+        Some((nrows as usize, ncols as usize))
+    } else {
+        None
+    };
     let flat: Vec<T> = T::read_full(&mut fptr)?;
 
     let mut plane: Vec<T> = if let Some(bb) = bbox {
+        let (nrows, ncols) = dims.expect("dims read when bbox is set");
         let view: ArrayView2<T> = ArrayView2::from_shape((nrows, ncols), &flat)?;
         // Slice rows xmin:xmax, cols ymin:ymax (matches numpy `[..., x, y]`).
         let sub = view.slice(ndarray::s![bb.xmin..bb.xmax, bb.ymin..bb.ymax]);
@@ -307,8 +317,13 @@ fn process_plane<T: CubeElem + num_traits::Float>(
 }
 
 /// Stream all channels into the initialised output cube.
+///
+/// `fptr` is the still-open output handle from [`create_output_cube`]; it is
+/// moved into the single writer thread and closed once at the end, so cfitsio
+/// flushes the data unit exactly once (written planes cover it, avoiding a
+/// wasted zero-fill pass).
 fn write_channels<T: CubeElem + num_traits::Float>(
-    out_cube: &Path,
+    mut fptr: FitsFile,
     file_list: &[PathBuf],
     new_to_old: &[Option<usize>],
     plane_len: usize,
@@ -316,37 +331,47 @@ fn write_channels<T: CubeElem + num_traits::Float>(
     invalidate_zeros: bool,
     max_workers: Option<usize>,
 ) -> Result<()> {
-    let bound = max_workers.unwrap_or(4).max(1);
+    // Buffer enough decoded planes that the parallel readers stay ahead of the
+    // single (serial) cfitsio writer instead of blocking on a tiny queue.
+    let default_bound = std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8);
+    let bound = max_workers.unwrap_or(default_bound).max(1);
     let (tx, rx) = sync_channel::<(usize, Vec<T>)>(bound);
 
+    // cfitsio's handle is not `Send`, so the writer stays on this thread; the
+    // parallel readers run in a spawned producer thread (rayon pool) and stream
+    // decoded planes back over the channel.
     std::thread::scope(|scope| -> Result<()> {
-        // Single writer thread (cfitsio handle is not thread-safe).
-        let writer = scope.spawn(move || -> Result<()> {
-            let mut fptr = FitsFile::edit(out_cube.to_string_lossy().as_ref())?;
-            for (chan, data) in rx {
-                let start = chan * plane_len;
-                T::write_section(&mut fptr, start, start + data.len(), &data)?;
-            }
-            Ok(())
+        let producer = scope.spawn(move || -> Result<()> {
+            let res =
+                (0..new_to_old.len())
+                    .into_par_iter()
+                    .try_for_each(|new_chan| -> Result<()> {
+                        let plane = match new_to_old[new_chan] {
+                            Some(old) => {
+                                process_plane::<T>(&file_list[old], bbox, invalidate_zeros)?
+                            }
+                            None => vec![T::nan(); plane_len], // missing → blank plane
+                        };
+                        tx.send((new_chan, plane)).map_err(|e| {
+                            FitsCubeError::Other(format!("channel send failed: {e}"))
+                        })?;
+                        Ok(())
+                    });
+            drop(tx); // close the channel so the writer loop below ends
+            res
         });
 
-        // Parallel producers: read + decode + process each plane.
-        let result = (0..new_to_old.len())
-            .into_par_iter()
-            .try_for_each(|new_chan| -> Result<()> {
-                let plane = match new_to_old[new_chan] {
-                    Some(old) => process_plane::<T>(&file_list[old], bbox, invalidate_zeros)?,
-                    None => vec![T::nan(); plane_len], // missing → blank plane
-                };
-                tx.send((new_chan, plane))
-                    .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
-                Ok(())
-            });
-        drop(tx); // close channel so the writer loop ends
-        result?;
-        writer
+        // Writer (this thread): consume planes and write them via cfitsio.
+        for (chan, data) in rx {
+            let start = chan * plane_len;
+            T::write_section(&mut fptr, start, start + data.len(), &data)?;
+        }
+
+        producer
             .join()
-            .map_err(|_| FitsCubeError::Other("writer thread panicked".to_string()))?
+            .map_err(|_| FitsCubeError::Other("reader thread panicked".to_string()))?
     })
 }
 
@@ -410,8 +435,8 @@ pub fn combine_fits(
         None
     };
 
-    // Initialise output cube.
-    let init = create_output_cube(
+    // Initialise output cube (returns the open handle for the writer).
+    let (init, out_fptr) = create_output_cube(
         &sorted_files[0],
         out_cube,
         &specs,
@@ -446,7 +471,7 @@ pub fn combine_fits(
     // Stream planes in the output precision.
     match init.pixel_type {
         PixelType::F32 => write_channels::<f32>(
-            out_cube,
+            out_fptr,
             &sorted_files,
             &new_to_old,
             init.plane_len,
@@ -455,7 +480,7 @@ pub fn combine_fits(
             options.max_workers,
         )?,
         PixelType::F64 => write_channels::<f64>(
-            out_cube,
+            out_fptr,
             &sorted_files,
             &new_to_old,
             init.plane_len,
