@@ -132,13 +132,50 @@ fn np_arange_fix(start: f64, stop: f64, step: f64) -> Vec<f64> {
     out
 }
 
+/// Fundamental channel step: the gcd of the observed diffs.
+///
+/// On a regular grid with missing channels every diff is an integer multiple
+/// of the channel width, so the gcd recovers that width even when no two
+/// surviving channels are adjacent — the case where `min(diffs)` overestimates
+/// the step (e.g. present channels 0, 3, 5 give `min = 2` but the true step is
+/// 1). Falls back to `min(diffs)` if the gcd is numerically unstable or does
+/// not divide every diff, so the common case is bit-for-bit unchanged (any
+/// surviving adjacent pair makes the gcd equal the minimum diff exactly).
+fn grid_step(diffs: &[f64]) -> f64 {
+    let min_diff = diffs.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_diff = diffs.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+    let tol = max_diff * 1e-6;
+
+    let mut g = diffs[0].abs();
+    for &d in &diffs[1..] {
+        let (mut a, mut b) = if g >= d.abs() { (g, d.abs()) } else { (d.abs(), g) };
+        // Tolerant Euclid: stop once the remainder is within the noise floor.
+        while b > tol {
+            let r = a % b;
+            a = b;
+            b = r;
+        }
+        g = a;
+    }
+
+    let divides_all = diffs.iter().all(|&d| {
+        let q = d.abs() / g;
+        (q - q.round()).abs() <= 1e-3
+    });
+    if g <= tol || !divides_all {
+        min_diff
+    } else {
+        g
+    }
+}
+
 /// Build an evenly-spaced axis from possibly-uneven input values, flagging the
 /// interpolated gaps as missing channels. Mirrors `even_spacing`.
 pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> (Vec<f64>, Vec<bool>) {
     assert!(specs.len() >= 2, "need at least two values to space evenly");
     let diffs: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
-    let min_diff = diffs.iter().cloned().fold(f64::INFINITY, f64::min);
-    let new_specs = np_arange_fix(specs[0], specs[specs.len() - 1], min_diff);
+    let step = grid_step(&diffs);
+    let new_specs = np_arange_fix(specs[0], specs[specs.len() - 1], step);
     let present = isin_close(&new_specs, specs, time_domain_mode);
     let missing: Vec<bool> = present.iter().map(|&p| !p).collect();
     (new_specs, missing)
@@ -245,6 +282,20 @@ mod tests {
         // The interpolated 3 GHz slot is the only missing one.
         assert_eq!(missing.iter().filter(|&&m| m).count(), 1);
         assert!(missing[2]);
+    }
+
+    #[test]
+    fn non_adjacent_gaps_recover_true_step() {
+        // Present channels 0, 3, 5 on a unit grid (1, 2, 4 missing). No two
+        // surviving channels are adjacent, so `min(diffs) == 2` would mis-grid
+        // the axis to [0, 2, 4] and drop the real channels. The gcd of the
+        // diffs [3, 2] recovers the true step of 1.
+        let specs = vec![0.0, 3.0, 5.0];
+        let (new, missing) = even_spacing(&specs, false);
+        assert_eq!(new.len(), 6, "should rebuild the full 0..=5 grid");
+        assert_eq!(missing.iter().filter(|&&m| m).count(), 3);
+        let expected = [false, true, true, false, true, false];
+        assert_eq!(missing, expected);
     }
 
     #[test]
