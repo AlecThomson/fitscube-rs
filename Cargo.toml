@@ -27,7 +27,7 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "fitscube"
+name = "fitscubers"
 path = "src/main.rs"
 
 [features]
