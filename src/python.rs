@@ -83,6 +83,8 @@ fn combine_fits(
         bounding_box,
         invalidate_zeros,
         float_length,
+        // No stderr progress bars when driven from Python.
+        progress: false,
     };
     rust_combine_fits(&file_list, &out_cube, &options).map_err(to_py_err)
 }

@@ -23,6 +23,7 @@ use crate::fits_io::{
     extract_header_layout, find_target_axis, has_key, update_key_f64, update_key_i64,
     update_key_logical, update_key_str, write_comment,
 };
+use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
 
 /// FITS records are 2880 bytes; headers and the data unit are each padded up to
@@ -74,6 +75,9 @@ pub struct CombineOptions {
     /// Output floating-point precision in bits. Only 32 and 64 are valid FITS
     /// float widths (BITPIX −32 / −64); other values are rejected.
     pub float_length: Option<u8>,
+    /// Draw progress bars/spinners to stderr. The CLI sets this; the Python
+    /// bindings leave it off so importing the module stays silent.
+    pub progress: bool,
 }
 
 /// Validate `float_length` and map it to a FITS BITPIX, or `None` to inherit
@@ -376,6 +380,7 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
     bbox: Option<&BoundingBox>,
     invalidate_zeros: bool,
     max_workers: Option<usize>,
+    progress: bool,
 ) -> Result<()> {
     let n_chan = new_to_old.len();
     let plane_bytes = (plane_len * T::WIDTH) as u64;
@@ -419,6 +424,11 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
         });
 
         // Writer (this thread): byte-swap each plane and write it at its offset.
+        let pb = progress.then(|| {
+            let bar = progress_bar(n_chan as u64);
+            bar.set_message("writing planes");
+            bar
+        });
         let mut buf: Vec<u8> = Vec::with_capacity(plane_bytes as usize);
         for (chan, data) in rx {
             buf.clear();
@@ -427,6 +437,12 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
             }
             let offset = layout.datastart + chan as u64 * plane_bytes;
             file.write_all_at(&buf, offset)?;
+            if let Some(bar) = &pb {
+                bar.inc(1);
+            }
+        }
+        if let Some(bar) = &pb {
+            bar.finish_with_message("planes written");
         }
 
         producer
@@ -477,6 +493,9 @@ pub fn combine_fits(
 
     // Optional common bounding box (computed from the sorted files).
     let final_bbox: Option<BoundingBox> = if options.bounding_box {
+        let spin = options
+            .progress
+            .then(|| spinner("solving for common bounding box"));
         let boxes: Vec<Option<BoundingBox>> = sorted_files
             .par_iter()
             .map(|p| -> Result<Option<BoundingBox>> {
@@ -489,6 +508,9 @@ pub fn combine_fits(
             })
             .collect::<Result<Vec<_>>>()?;
         let bb = extract_common_bounding_box(&boxes)?;
+        if let Some(spin) = spin {
+            spin.finish_and_clear();
+        }
         tracing::info!("The final bounding box is: {bb:?}");
         Some(bb)
     } else {
@@ -539,6 +561,7 @@ pub fn combine_fits(
             final_bbox.as_ref(),
             options.invalidate_zeros,
             options.max_workers,
+            options.progress,
         )?,
         PixelType::F64 => write_cube_raw::<f64>(
             out_cube,
@@ -549,6 +572,7 @@ pub fn combine_fits(
             final_bbox.as_ref(),
             options.invalidate_zeros,
             options.max_workers,
+            options.progress,
         )?,
     }
 
