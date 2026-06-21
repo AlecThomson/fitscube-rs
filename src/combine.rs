@@ -19,6 +19,7 @@ use crate::fits_io::{
     CubeElem, HeaderGeom, PixelType, create_cube_open, delete_key, find_target_axis, has_key,
     update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
 };
+use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
 
 /// Options for [`combine_fits`], mirroring the keyword arguments of the Python
@@ -37,6 +38,9 @@ pub struct CombineOptions {
     /// Output floating-point precision in bits. Only 32 and 64 are valid FITS
     /// float widths (BITPIX −32 / −64); other values are rejected.
     pub float_length: Option<u8>,
+    /// Draw progress bars/spinners to stderr. The CLI sets this; the Python
+    /// bindings leave it off so importing the module stays silent.
+    pub progress: bool,
 }
 
 /// Validate `float_length` and map it to a FITS BITPIX, or `None` to inherit
@@ -322,6 +326,7 @@ fn process_plane<T: CubeElem + num_traits::Float>(
 /// moved into the single writer thread and closed once at the end, so cfitsio
 /// flushes the data unit exactly once (written planes cover it, avoiding a
 /// wasted zero-fill pass).
+#[allow(clippy::too_many_arguments)]
 fn write_channels<T: CubeElem + num_traits::Float>(
     mut fptr: FitsFile,
     file_list: &[PathBuf],
@@ -330,6 +335,7 @@ fn write_channels<T: CubeElem + num_traits::Float>(
     bbox: Option<&BoundingBox>,
     invalidate_zeros: bool,
     max_workers: Option<usize>,
+    progress: bool,
 ) -> Result<()> {
     // Buffer enough decoded planes that the parallel readers stay ahead of the
     // single (serial) cfitsio writer instead of blocking on a tiny queue.
@@ -364,9 +370,20 @@ fn write_channels<T: CubeElem + num_traits::Float>(
         });
 
         // Writer (this thread): consume planes and write them via cfitsio.
+        let pb = progress.then(|| {
+            let bar = progress_bar(new_to_old.len() as u64);
+            bar.set_message("writing planes");
+            bar
+        });
         for (chan, data) in rx {
             let start = chan * plane_len;
             T::write_section(&mut fptr, start, start + data.len(), &data)?;
+            if let Some(bar) = &pb {
+                bar.inc(1);
+            }
+        }
+        if let Some(bar) = &pb {
+            bar.finish_with_message("planes written");
         }
 
         producer
@@ -417,6 +434,9 @@ pub fn combine_fits(
 
     // Optional common bounding box (computed from the sorted files).
     let final_bbox: Option<BoundingBox> = if options.bounding_box {
+        let spin = options
+            .progress
+            .then(|| spinner("solving for common bounding box"));
         let boxes: Vec<Option<BoundingBox>> = sorted_files
             .par_iter()
             .map(|p| -> Result<Option<BoundingBox>> {
@@ -429,6 +449,9 @@ pub fn combine_fits(
             })
             .collect::<Result<Vec<_>>>()?;
         let bb = extract_common_bounding_box(&boxes)?;
+        if let Some(spin) = spin {
+            spin.finish_and_clear();
+        }
         tracing::info!("The final bounding box is: {bb:?}");
         Some(bb)
     } else {
@@ -478,6 +501,7 @@ pub fn combine_fits(
             final_bbox.as_ref(),
             options.invalidate_zeros,
             options.max_workers,
+            options.progress,
         )?,
         PixelType::F64 => write_channels::<f64>(
             out_fptr,
@@ -487,6 +511,7 @@ pub fn combine_fits(
             final_bbox.as_ref(),
             options.invalidate_zeros,
             options.max_workers,
+            options.progress,
         )?,
     }
 

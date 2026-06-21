@@ -105,10 +105,10 @@ with fits.open(out_cube) as hdul:
 ## Working with the CLI
 
 For batch jobs (hundreds of channels, large mosaics) prefer the
-[`fitscube` CLI](cli.md) — it parallelises the read/stack across workers and
+[`fitscubers` CLI](cli.md) — it parallelises the read/stack across workers and
 streams planes to disk so peak memory stays bounded:
 
 ```sh
-fitscube combine chan_*.fits cube.fits --overwrite
-fitscube extract cube.fits --channel-index 2 --output-path chan2.fits
+fitscubers combine chan_*.fits cube.fits --overwrite
+fitscubers extract cube.fits --channel-index 2 --output-path chan2.fits
 ```

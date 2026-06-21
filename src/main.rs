@@ -1,8 +1,8 @@
-//! `fitscube` command-line interface.
+//! `fitscubers` command-line interface.
 //!
 //! Two subcommands mirror the original package:
-//! * `fitscube combine` — combine single-plane images into a cube.
-//! * `fitscube extract` — extract one plane from a cube.
+//! * `fitscubers combine` — combine single-plane images into a cube.
+//! * `fitscubers extract` — extract one plane from a cube.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -15,7 +15,7 @@ use fitscube_rs::extract::{ExtractOptions, extract_plane_from_cube};
 
 #[derive(Parser)]
 #[command(
-    name = "fitscube",
+    name = "fitscubers",
     about = "Combine single-frequency/single-time FITS images into a cube, or extract a plane",
     version
 )]
@@ -133,6 +133,8 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         bounding_box: args.bounding_box,
         invalidate_zeros: args.invalidate_zeros,
         float_length: args.floating.as_deref().map(|s| s.parse().unwrap()),
+        // CLI: show progress bars on stderr.
+        progress: true,
     };
 
     let specs = combine_fits(&args.file_list, &args.out_cube, &options)
@@ -160,8 +162,10 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
         overwrite: args.overwrite,
         output_path: args.output_path,
     };
+    let spin = fitscube_rs::progress::spinner("extracting plane from cube");
     let out =
         extract_plane_from_cube(&args.fits_cube, &options).context("extracting plane from cube")?;
+    spin.finish_and_clear();
     info!("Written plane to {}", out.display());
     Ok(())
 }

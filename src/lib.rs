@@ -2,7 +2,7 @@
 //!
 //! A Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube)
 //! Python package. Also available as a Python package (`fitscube_rs`) and a CLI
-//! tool (`fitscube`).
+//! tool (`fitscubers`).
 //!
 //! # Overview
 //!
@@ -21,6 +21,7 @@ pub mod combine;
 pub mod error;
 pub mod extract;
 pub mod fits_io;
+pub mod progress;
 pub mod specs;
 
 pub use beams::Beam;

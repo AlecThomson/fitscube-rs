@@ -65,7 +65,7 @@ extensions = [
     "sphinx.ext.napoleon",
     "sphinx_copybutton",
     "autoapi.extension",
-    # Runs the `fitscube` CLI at build time so the help text in cli.md is
+    # Runs the `fitscubers` CLI at build time so the help text in cli.md is
     # generated from the binary, never hand-copied. Needs a Rust toolchain.
     "sphinxcontrib.programoutput",
 ]
