@@ -148,7 +148,11 @@ fn grid_step(diffs: &[f64]) -> f64 {
 
     let mut g = diffs[0].abs();
     for &d in &diffs[1..] {
-        let (mut a, mut b) = if g >= d.abs() { (g, d.abs()) } else { (d.abs(), g) };
+        let (mut a, mut b) = if g >= d.abs() {
+            (g, d.abs())
+        } else {
+            (d.abs(), g)
+        };
         // Tolerant Euclid: stop once the remainder is within the noise floor.
         while b > tol {
             let r = a % b;
