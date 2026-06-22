@@ -247,6 +247,10 @@ fn create_output_cube(
     // caller writes the header bytes and streams planes with raw I/O, so the data
     // unit is written exactly once and its untouched tail stays sparse — see
     // [`crate::mem_header`] and [`write_cube_raw`].
+    // Build the header in memory (no disk, so cfitsio never zero-fills the data
+    // unit) at its final shape/BITPIX. `create_mem_cube` allocates size-1 dummy
+    // axes internally — `extract_header_layout` stamps the real NAXISn into the
+    // serialised header — so no cube-sized buffer is ever allocated in RAM.
     let mut fptr = create_mem_cube(template, out_bitpix, &dims)?;
 
     // Spectral/temporal axis cards.
@@ -305,7 +309,7 @@ fn create_output_cube(
     }
 
     let plane_len = dims[0] * dims.get(1).copied().unwrap_or(1);
-    let layout = extract_header_layout(&mut fptr)?;
+    let layout = extract_header_layout(&mut fptr, &dims)?;
     Ok((
         InitResult {
             pixel_type: PixelType::from_bitpix(out_bitpix),
