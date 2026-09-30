@@ -175,14 +175,44 @@ fn grid_step(diffs: &[f64]) -> f64 {
 
 /// Build an evenly-spaced axis from possibly-uneven input values, flagging the
 /// interpolated gaps as missing channels. Mirrors `even_spacing`.
-pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> (Vec<f64>, Vec<bool>) {
-    assert!(specs.len() >= 2, "need at least two values to space evenly");
-    let diffs: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
+///
+/// A regular grid cannot always hold every input — an irregular spacing whose
+/// step cannot be recovered leaves inputs sitting between grid points, and
+/// equal values collapse onto one. Those inputs would be dropped from the cube
+/// without trace, so this returns [`FitsCubeError::IrregularSpacing`] rather
+/// than a grid that is missing data.
+pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, Vec<bool>)> {
+    // The grid is built from the first and last value, so an unsorted input would
+    // otherwise give an empty (or reversed) grid. Callers sort later, not here.
+    let mut sorted = specs.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if sorted.len() < 2 {
+        let n = sorted.len();
+        return Ok((sorted, vec![false; n]));
+    }
+
+    let diffs: Vec<f64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
     let step = grid_step(&diffs);
-    let new_specs = np_arange_fix(specs[0], specs[specs.len() - 1], step);
-    let present = isin_close(&new_specs, specs, time_domain_mode);
+    let new_specs = np_arange_fix(sorted[0], sorted[sorted.len() - 1], step);
+    let present = isin_close(&new_specs, &sorted, time_domain_mode);
     let missing: Vec<bool> = present.iter().map(|&p| !p).collect();
-    (new_specs, missing)
+
+    let populated = present.iter().filter(|&&p| p).count();
+    if populated != sorted.len() {
+        let (spequencies, unit) = if time_domain_mode {
+            ("times", "s")
+        } else {
+            ("frequencies", "Hz")
+        };
+        return Err(FitsCubeError::IrregularSpacing(format!(
+            "Cannot place all {} {spequencies} on a regular grid of {step} {unit} - only \
+             {populated} of {} grid points are matched, so blank channels would drop \
+             inputs. Combine without blank channels, or regrid the inputs onto a common step.",
+            sorted.len(),
+            new_specs.len()
+        )));
+    }
+    Ok((new_specs, missing))
 }
 
 /// Parse the spectral/temporal axis for a set of input files.
@@ -249,7 +279,7 @@ pub fn parse_specs(
 
     let (specs, missing) = if create_blanks {
         tracing::info!("Creating an evenly-spaced axis with interpolated blanks");
-        even_spacing(&file_specs, time_domain_mode)
+        even_spacing(&file_specs, time_domain_mode)?
     } else {
         (file_specs.clone(), vec![false; file_specs.len()])
     };
@@ -272,7 +302,7 @@ mod tests {
     #[test]
     fn even_axis_has_no_missing() {
         let specs = vec![1.0e9, 2.0e9, 3.0e9, 4.0e9];
-        let (new, missing) = even_spacing(&specs, false);
+        let (new, missing) = even_spacing(&specs, false).unwrap();
         assert_eq!(new.len(), 4);
         assert!(missing.iter().all(|&m| !m));
     }
@@ -281,7 +311,7 @@ mod tests {
     fn gap_is_flagged_missing() {
         // Missing the 3 GHz channel.
         let specs = vec![1.0e9, 2.0e9, 4.0e9];
-        let (new, missing) = even_spacing(&specs, false);
+        let (new, missing) = even_spacing(&specs, false).unwrap();
         assert_eq!(new.len(), 4);
         // The interpolated 3 GHz slot is the only missing one.
         assert_eq!(missing.iter().filter(|&&m| m).count(), 1);
@@ -295,11 +325,37 @@ mod tests {
         // the axis to [0, 2, 4] and drop the real channels. The gcd of the
         // diffs [3, 2] recovers the true step of 1.
         let specs = vec![0.0, 3.0, 5.0];
-        let (new, missing) = even_spacing(&specs, false);
+        let (new, missing) = even_spacing(&specs, false).unwrap();
         assert_eq!(new.len(), 6, "should rebuild the full 0..=5 grid");
         assert_eq!(missing.iter().filter(|&&m| m).count(), 3);
         let expected = [false, true, true, false, true, false];
         assert_eq!(missing, expected);
+    }
+
+    #[test]
+    fn unsorted_values_are_sorted_first() {
+        let (new, missing) = even_spacing(&[4.0e9, 1.0e9, 2.0e9], false).unwrap();
+        assert_eq!(new, vec![1.0e9, 2.0e9, 3.0e9, 4.0e9]);
+        assert_eq!(missing, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn fewer_than_two_values_are_even() {
+        assert_eq!(even_spacing(&[], false).unwrap(), (vec![], vec![]));
+        assert_eq!(
+            even_spacing(&[1.0e9], false).unwrap(),
+            (vec![1.0e9], vec![false])
+        );
+    }
+
+    #[test]
+    fn inputs_off_the_grid_are_refused() {
+        // No common step divides both 1 and sqrt(2)
+        let err = even_spacing(&[0.0, 1.0, 1.0 + std::f64::consts::SQRT_2], false).unwrap_err();
+        assert!(matches!(err, FitsCubeError::IrregularSpacing(_)), "{err:?}");
+        // Duplicates collapse onto one grid point
+        let err = even_spacing(&[0.0, 0.0, 2.0], false).unwrap_err();
+        assert!(matches!(err, FitsCubeError::IrregularSpacing(_)), "{err:?}");
     }
 
     #[test]

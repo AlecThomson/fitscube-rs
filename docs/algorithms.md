@@ -14,8 +14,14 @@ channel (the default) or one time step (`--time-domain`). fitscube-rs reads the
 3D (or 4D, with a degenerate Stokes axis preserved) cube whose plane order
 follows the order the files are given.
 
-Every input is checked for a consistent shape and pixel grid; a plane that does
-not match the others is an error rather than a silent reshape. The spatial WCS
+Before any output is written, every input header is checked against the first:
+the same pixel grid (`NAXIS1`/`NAXIS2`), the same axes in the same order (the
+`CTYPE` of every axis), and the same Stokes parameter. The cube is labelled from
+the first image, so an input that differs is an error rather than a silently
+mislabelled or scrambled plane. Each input may carry several planes of its own
+(e.g. a Stokes axis) as long as they sit below the combine axis: the
+frequency/time axis must be the slowest-varying axis of the cube, since each
+channel is written at a fixed offset. The spatial WCS
 (`CRVAL1/2`, `CDELT1/2`, projection, …) is taken from the first image and
 carried onto the cube unchanged.
 
@@ -49,6 +55,13 @@ the new axis in the output WCS:
   frequency (or time) of every plane is recoverable. The user is warned that
   the axis is non-linear.
 
+With `--create-blanks`, fitscube-rs instead builds a regular grid through the
+inputs (sorted first, with the step recovered as the greatest common divisor of
+the gaps) and fills the grid points without an input with blank (NaN) planes.
+If some input would not land on a grid point — an irregular spacing with no
+common step, or two inputs at the same frequency — the combine is refused
+rather than silently dropping that input.
+
 ## Per-channel beams (`BEAMS` table)
 
 Radio images frequently carry a restoring beam (`BMAJ`, `BMIN`, `BPA`) that
@@ -56,11 +69,27 @@ differs from plane to plane. fitscube-rs preserves this:
 
 - If all input planes share one beam, the single `BMAJ`/`BMIN`/`BPA` is written
   to the primary header.
+- Beams follow the planes: they are sorted with them, and blank channels get a
+  NaN beam. Any input with a beam counts, not just the first.
 - If the beams differ across planes, fitscube-rs writes a CASA-style `BEAMS`
-  binary-table extension — one row per plane with that plane's beam (and its
-  channel/Stokes index) — and sets `CASAMBM=T` in the primary header. This is
+  binary-table extension — one row per plane with that plane's beam and its
+  `CHAN`/`POL`, which are 0-based indices into the cube's frequency (or time)
+  and Stokes axes, not FITS Stokes codes — and sets `CASAMBM=T` in the primary header. This is
   the multi-beam convention understood by CASA and `astropy`, so per-channel
-  beam information survives the round trip into the cube.
+  beam information survives the round trip into the cube. Only single-Stokes
+  cubes are supported (`POL = 0`, `NPOL = 1`); a multi-Stokes cube with
+  varying beams is refused before any data are written.
+- A NaN beam is stored as `numpy.finfo(float32).tiny`, the sentinel CASA
+  expects, and so is an exactly-zero beam, which is not a valid PSF.
+
+### Zero beams
+
+wsclean writes `BMAJ = BMIN = 0` into an image when no PSF was fitted for that
+plane. With `-fit-spectral-pol` the channels that were not imaged directly are
+filled with the model image instead, which looks like data but is not
+comparable to the rest of the cube. By default such planes are blanked with
+NaNs (with a warning naming the channels); `--no-blank-zero-beams`
+(`blank_zero_beams=False`) keeps their data.
 
 ## Bounding-box trimming
 
@@ -72,6 +101,10 @@ correct. This shrinks cubes that were padded out to a large common canvas
 without discarding any real data. `--invalidate-zeros` first treats exact-zero
 pixels as blank, so zero-padded borders are trimmed too.
 
+From Python, compute the box once with `get_common_bounding_box` and pass it as
+`combine_fits(..., bounding_box=box)` to trim several cubes — e.g. an image
+cube and its weights cube — to an identical pixel grid.
+
 ## Floating-point precision
 
 `--floating {32,64}` selects the pixel data type of the output cube
@@ -79,6 +112,11 @@ pixels as blank, so zero-padded borders are trimmed too.
 float widths the FITS standard defines, so other values are rejected. The
 default follows the inputs; downcasting to `float32` is offered for cubes where
 storage matters more than the last bits of precision.
+
+Integer inputs are copied as integers at their own BITPIX, keeping any
+`BSCALE`/`BZERO`. Blank planes (from `--create-blanks` or zero beams) and
+`--invalidate-zeros` are written as NaNs, which an integer cube cannot hold, so
+those need `--floating 32` or `--floating 64`.
 
 ## Plane extraction
 

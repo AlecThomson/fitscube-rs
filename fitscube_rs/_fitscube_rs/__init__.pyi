@@ -6,11 +6,66 @@ import os
 import pathlib
 import typing
 __all__ = [
+    "BoundingBox",
     "combine_fits",
     "extract_plane_from_cube",
+    "get_common_bounding_box",
 ]
 
-def combine_fits(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], out_cube: builtins.str | os.PathLike | pathlib.Path, spec_file: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, spec_list: typing.Optional[typing.Sequence[builtins.float]] = None, ignore_spec: builtins.bool = False, create_blanks: builtins.bool = False, overwrite: builtins.bool = False, max_workers: typing.Optional[builtins.int] = None, time_domain_mode: builtins.bool = False, bounding_box: builtins.bool = False, invalidate_zeros: builtins.bool = False, float_length: typing.Optional[builtins.int] = None) -> builtins.list[builtins.float]:
+@typing.final
+class BoundingBox:
+    r"""
+    Pixel bounds of the valid data of an image, as used to trim a cube.
+    
+    ``x`` and ``y`` are the *numpy* axes, the reverse of the FITS ``NAXIS``
+    convention: ``x`` is image rows (``NAXIS2``) and ``y`` is image columns
+    (``NAXIS1``). Minimum values are inclusive and maximum values exclusive, so
+    a plane is sliced as ``data[..., xmin:xmax, ymin:ymax]``.
+    """
+    @property
+    def xmin(self) -> builtins.int:
+        r"""
+        Minimum row pixel (numpy axis -2, FITS NAXIS2). Inclusive.
+        """
+    @property
+    def xmax(self) -> builtins.int:
+        r"""
+        Maximum row pixel (numpy axis -2, FITS NAXIS2). Exclusive.
+        """
+    @property
+    def ymin(self) -> builtins.int:
+        r"""
+        Minimum column pixel (numpy axis -1, FITS NAXIS1). Inclusive.
+        """
+    @property
+    def ymax(self) -> builtins.int:
+        r"""
+        Maximum column pixel (numpy axis -1, FITS NAXIS1). Exclusive.
+        """
+    @property
+    def original_shape(self) -> tuple[builtins.int, builtins.int]:
+        r"""
+        Shape (rows, columns) of the plane the box was built from.
+        """
+    @property
+    def y_span(self) -> builtins.int:
+        r"""
+        The span between ymax and ymin (i.e. the trimmed NAXIS1).
+        """
+    @property
+    def x_span(self) -> builtins.int:
+        r"""
+        The span between xmax and xmin (i.e. the trimmed NAXIS2).
+        """
+    def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
+    def __new__(cls, xmin: builtins.int, xmax: builtins.int, ymin: builtins.int, ymax: builtins.int, original_shape: tuple[builtins.int, builtins.int]) -> BoundingBox:
+        r"""
+        A box over rows ``xmin:xmax`` and columns ``ymin:ymax`` of a plane of
+        shape ``original_shape`` (rows, columns).
+        """
+    def __repr__(self) -> builtins.str: ...
+
+def combine_fits(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], out_cube: builtins.str | os.PathLike | pathlib.Path, spec_file: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, spec_list: typing.Optional[typing.Sequence[builtins.float]] = None, ignore_spec: builtins.bool = False, create_blanks: builtins.bool = False, overwrite: builtins.bool = False, max_workers: typing.Optional[builtins.int] = None, time_domain_mode: builtins.bool = False, bounding_box: builtins.bool  |  BoundingBox = False, invalidate_zeros: builtins.bool = False, float_length: typing.Optional[builtins.int] = None, blank_zero_beams: builtins.bool = True) -> builtins.list[builtins.float]:
     r"""
     Combine single-plane FITS images into a cube.
     
@@ -26,9 +81,15 @@ def combine_fits(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib
         overwrite (bool): Overwrite the output cube if it exists.
         max_workers (int, optional): Concurrency bound for in-flight planes.
         time_domain_mode (bool): Combine along time (DATE-OBS) instead of FREQ.
-        bounding_box (bool): Trim blank padding via a common bounding box.
+        bounding_box (bool | BoundingBox): Trim blank padding via a common
+            bounding box. A ``BoundingBox`` is used as is (see
+            ``get_common_bounding_box``) to force several cubes onto an
+            identical pixel grid.
         invalidate_zeros (bool): Treat exactly-zero pixels as NaN.
         float_length (int, optional): Output precision in bits (32 or 64).
+        blank_zero_beams (bool): Blank (NaN) any input image whose restoring
+            beam is exactly zero, e.g. a wsclean ``-fit-spectral-pol`` model
+            plane (default True).
     
     Returns:
         list[float]: The output-axis values (Hz for frequency, MJD s for time).
@@ -57,5 +118,26 @@ def extract_plane_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Path
     
     Raises:
         ValueError: On invalid options or a FITS error.
+    """
+
+def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], invalidate_zeros: builtins.bool = False) -> BoundingBox:
+    r"""
+    Compute the single bounding box that encompasses the valid data of every
+    image in ``file_list``.
+    
+    This is the box ``combine_fits`` computes internally when
+    ``bounding_box=True``. Compute it once with this function and pass the
+    result to ``combine_fits(bounding_box=...)`` when several cubes (e.g. an
+    image cube and its weights cube) must land on an identical pixel grid.
+    
+    Args:
+        file_list (list[str]): The FITS images to consider.
+        invalidate_zeros (bool): Treat exactly-zero pixels as invalid.
+    
+    Returns:
+        BoundingBox: The smallest bounding box that contains all valid data.
+    
+    Raises:
+        ValueError: If no image has valid data, or on a FITS error.
     """
 

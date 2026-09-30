@@ -5,10 +5,15 @@
 //! clipped when building a cube. The naming follows the Python original, where
 //! `x` is the slow (row / axis-0) direction and `y` is the fast (column /
 //! axis-1) direction.
+use std::path::{Path, PathBuf};
+
+use fitsio::FitsFile;
 use ndarray::ArrayView2;
 use num_traits::Float;
+use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
+use crate::fits_io::HeaderGeom;
 
 /// Pixel bounds of the valid (finite) region of a 2D image.
 ///
@@ -33,7 +38,9 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
-    fn new(
+    /// A box over rows `xmin..xmax` and columns `ymin..ymax` of a plane of
+    /// shape `(nrows, ncols)`.
+    pub fn new(
         xmin: usize,
         xmax: usize,
         ymin: usize,
@@ -101,6 +108,59 @@ pub fn create_bound_box_plane<T: Float>(image: &ArrayView2<T>) -> Option<Boundin
         ymax + 1,
         (nrows, ncols),
     ))
+}
+
+/// Bounding box of the valid data of one FITS image. Mirrors
+/// `get_bounding_box_for_fits`.
+///
+/// Degenerate axes are dropped, so the image must hold a single 2D plane.
+/// `None` if every pixel is invalid.
+pub fn get_bounding_box_for_fits(
+    path: &Path,
+    invalidate_zeros: bool,
+) -> Result<Option<BoundingBox>> {
+    let geom = HeaderGeom::read(path)?;
+    let squeezed: Vec<usize> = geom.dims.iter().copied().filter(|&n| n != 1).collect();
+    let (nrows, ncols) = match squeezed.as_slice() {
+        [ncols, nrows] => (*nrows, *ncols),
+        _ => {
+            return Err(FitsCubeError::ShapeMismatch(format!(
+                "Only two-dimensional images can be bounded, but {} has shape {:?}",
+                path.display(),
+                geom.dims
+            )));
+        }
+    };
+    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
+    let hdu = fptr.primary_hdu()?;
+    let mut data: Vec<f64> = hdu.read_image(&mut fptr)?;
+    if invalidate_zeros {
+        for v in &mut data {
+            if *v == 0.0 {
+                *v = f64::NAN;
+            }
+        }
+    }
+    let view = ArrayView2::from_shape((nrows, ncols), &data)?;
+    Ok(create_bound_box_plane(&view))
+}
+
+/// The single bounding box that encompasses the valid data of every image in
+/// `file_list`. Mirrors `get_common_bounding_box`.
+///
+/// This is the box [`crate::combine_fits`] computes internally with
+/// `bounding_box: true`. Compute it once with this function and pass it as
+/// `supplied_bounding_box` when several cubes (e.g. an image cube and its
+/// weights cube) must land on an identical pixel grid.
+pub fn get_common_bounding_box(
+    file_list: &[PathBuf],
+    invalidate_zeros: bool,
+) -> Result<BoundingBox> {
+    let boxes = file_list
+        .par_iter()
+        .map(|p| get_bounding_box_for_fits(p, invalidate_zeros))
+        .collect::<Result<Vec<_>>>()?;
+    extract_common_bounding_box(&boxes)
 }
 
 /// Smallest bounding box that encompasses all the given boxes.

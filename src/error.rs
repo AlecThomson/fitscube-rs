@@ -43,6 +43,42 @@ pub enum FitsCubeError {
     #[error("channel missing: {0}")]
     ChannelMissing(String),
 
+    /// Input images do not share a common pixel grid.
+    ///
+    /// Equivalent to Python `ShapeMismatchException`.
+    #[error("shape mismatch: {0}")]
+    ShapeMismatch(String),
+
+    /// Input images do not share the same axes, in the same order.
+    ///
+    /// Equivalent to Python `AxisMismatchException`.
+    #[error("axis mismatch: {0}")]
+    AxisMismatch(String),
+
+    /// Input images do not share the same Stokes parameter.
+    ///
+    /// Equivalent to Python `StokesMismatchException`.
+    #[error("Stokes mismatch: {0}")]
+    StokesMismatch(String),
+
+    /// The combine axis is not the slowest-varying axis of the cube.
+    ///
+    /// Equivalent to Python `AxisOrderException`.
+    #[error("axis order: {0}")]
+    AxisOrder(String),
+
+    /// A regular grid through the inputs would drop some of them.
+    ///
+    /// Equivalent to Python `IrregularSpacingException`.
+    #[error("irregular spacing: {0}")]
+    IrregularSpacing(String),
+
+    /// A valid input the port does not support yet (e.g. multi-Stokes beams).
+    ///
+    /// Equivalent to Python `NotImplementedError`.
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     /// The output file already exists and `overwrite` was not set.
     #[error("output file {0} already exists (use overwrite)")]
     OutputExists(PathBuf),
