@@ -20,9 +20,9 @@ Repository = "https://github.com/AlecThomson/fitscube-rs"
 
 [project.optional-dependencies]
 # Parity tests run both implementations on the same inputs and compare; the
-# reference `fitscube` must be >=2.3.1 (the release with the lossless
-# bounding-box fix that fitscube-rs implements).
-test = ["pytest", "numpy", "astropy", "radio-beam", "fitscube>=2.3.1"]
+# reference `fitscube` must be >=2.8.0 (the release whose fixes fitscube-rs
+# implements, the last being the 0-based BEAMS POL column).
+test = ["pytest", "numpy", "astropy", "radio-beam", "fitscube>=2.8.0"]
 dev = ["prek", "ty"]
 
 [dependency-groups]

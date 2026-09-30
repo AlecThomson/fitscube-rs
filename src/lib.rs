@@ -26,7 +26,9 @@ pub mod progress;
 pub mod specs;
 
 pub use beams::Beam;
-pub use bounding_box::{BoundingBox, create_bound_box_plane, extract_common_bounding_box};
+pub use bounding_box::{
+    BoundingBox, create_bound_box_plane, extract_common_bounding_box, get_common_bounding_box,
+};
 pub use combine::{CombineOptions, combine_fits};
 pub use error::{FitsCubeError, Result};
 pub use extract::{ExtractOptions, extract_plane_from_cube};

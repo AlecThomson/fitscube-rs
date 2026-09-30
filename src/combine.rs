@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
 use fitsio::FitsFile;
-use ndarray::{Array2, ArrayView2};
+use ndarray::ArrayView2;
 use rayon::prelude::*;
 
 use crate::beams::{self, Beam};
-use crate::bounding_box::{BoundingBox, create_bound_box_plane, extract_common_bounding_box};
+use crate::bounding_box::{BoundingBox, get_common_bounding_box};
 use crate::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use crate::error::{FitsCubeError, Result};
 use crate::fits_io::{
-    CubeElem, CubeLayout, HeaderGeom, PixelType, create_mem_cube, delete_key,
-    extract_header_layout, find_target_axis, has_key, update_key_f64, update_key_i64,
-    update_key_logical, update_key_str, write_comment,
+    CubeElem, CubeLayout, HeaderGeom, create_mem_cube, delete_key, extract_header_layout,
+    find_target_axis, has_key, read_key_f64, update_key_f64, update_key_i64, update_key_logical,
+    update_key_str, write_comment,
 };
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
@@ -60,9 +60,21 @@ impl BeBytes for f64 {
     }
 }
 
+macro_rules! impl_be_bytes_int {
+    ($($t:ty),*) => {$(
+        impl BeBytes for $t {
+            const WIDTH: usize = std::mem::size_of::<$t>();
+            fn extend_be(self, buf: &mut Vec<u8>) {
+                buf.extend_from_slice(&self.to_be_bytes());
+            }
+        }
+    )*};
+}
+impl_be_bytes_int!(i16, i32, i64);
+
 /// Options for [`combine_fits`], mirroring the keyword arguments of the Python
 /// `combine_fits`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CombineOptions {
     pub spec_file: Option<PathBuf>,
     pub spec_list: Option<Vec<f64>>,
@@ -72,6 +84,11 @@ pub struct CombineOptions {
     pub max_workers: Option<usize>,
     pub time_domain_mode: bool,
     pub bounding_box: bool,
+    /// A bounding box to trim to, used as is (it takes precedence over
+    /// `bounding_box`), so that separate cubes — e.g. an image cube and its
+    /// weights cube — can be forced onto a common pixel grid. See
+    /// [`crate::bounding_box::get_common_bounding_box`].
+    pub supplied_bounding_box: Option<BoundingBox>,
     pub invalidate_zeros: bool,
     /// Output floating-point precision in bits. Only 32 and 64 are valid FITS
     /// float widths (BITPIX −32 / −64); other values are rejected.
@@ -79,6 +96,31 @@ pub struct CombineOptions {
     /// Draw progress bars/spinners to stderr. The CLI sets this; the Python
     /// bindings leave it off so importing the module stays silent.
     pub progress: bool,
+    /// Blank (NaN) any input image whose restoring beam is exactly zero.
+    /// wsclean writes such a beam when a plane holds no fitted PSF — e.g. the
+    /// model image `-fit-spectral-pol` plants into a channel — and those planes
+    /// are not comparable to the rest of the cube. Defaults to `true`.
+    pub blank_zero_beams: bool,
+}
+
+impl Default for CombineOptions {
+    fn default() -> Self {
+        Self {
+            spec_file: None,
+            spec_list: None,
+            ignore_spec: false,
+            create_blanks: false,
+            overwrite: false,
+            max_workers: None,
+            time_domain_mode: false,
+            bounding_box: false,
+            supplied_bounding_box: None,
+            invalidate_zeros: false,
+            float_length: None,
+            progress: false,
+            blank_zero_beams: true,
+        }
+    }
 }
 
 /// Validate `float_length` and map it to a FITS BITPIX, or `None` to inherit
@@ -163,8 +205,11 @@ struct AxisPlacement {
 
 /// Result of initialising the output cube.
 struct InitResult {
-    pixel_type: PixelType,
-    /// Output plane length (NAXIS1 × NAXIS2 after any bounding-box trim).
+    /// BITPIX of the output data unit.
+    bitpix: i64,
+    /// Pixels in one output channel: the product of every axis below the
+    /// combine axis (NAXIS1 × NAXIS2 after any bounding-box trim, times any
+    /// Stokes or other axes of the inputs).
     plane_len: usize,
 }
 
@@ -236,6 +281,25 @@ fn create_output_cube(
         dims[1] = bb.x_span;
     }
 
+    // Planes are written at an offset of (plane bytes × channel), which only
+    // lands on the right plane when the combine axis is the slowest-varying one
+    // — i.e. every axis above it in the cube is degenerate.
+    let trailing: Vec<String> = dims
+        .iter()
+        .enumerate()
+        .skip(fi)
+        .filter(|&(_, &n)| n != 1)
+        .map(|(i, n)| format!("NAXIS{}={n}", i + 1))
+        .collect();
+    if !trailing.is_empty() {
+        return Err(FitsCubeError::AxisOrder(format!(
+            "The {ctype} axis (NAXIS{fi}) must be the slowest-varying axis of the \
+             output cube, but non-degenerate axes sit above it: {}. Reorder the axes \
+             of the input images before combining.",
+            trailing.join(", ")
+        )));
+    }
+
     let in_bitpix = geom.bitpix;
     let out_bitpix = float_length_to_bitpix(float_length)?.unwrap_or(in_bitpix);
 
@@ -253,6 +317,17 @@ fn create_output_cube(
     // axes internally — `extract_header_layout` stamps the real NAXISn into the
     // serialised header — so no cube-sized buffer is ever allocated in RAM.
     let mut fptr = create_mem_cube(template, out_bitpix, &dims)?;
+
+    // Integer cubes copy the inputs' stored values (see
+    // [`process_plane_raw_int`]), so they keep the scaling that decodes them;
+    // float cubes hold decoded values and must not.
+    if out_bitpix > 0 {
+        for key in ["BSCALE", "BZERO"] {
+            if let Some(value) = read_key_f64(template, key)? {
+                update_key_f64(&mut fptr, key, value)?;
+            }
+        }
+    }
 
     // Spectral/temporal axis cards.
     update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
@@ -293,7 +368,7 @@ fn create_output_cube(
         )?;
         write_comment(
             &mut fptr,
-            &format!("The value '{tiny}' repsenents a NaN PSF in the beamtable."),
+            &format!("The value '{tiny}' represents a NaN PSF in the beamtable."),
         )?;
         delete_key(&mut fptr, "BMAJ")?;
         delete_key(&mut fptr, "BMIN")?;
@@ -309,19 +384,44 @@ fn create_output_cube(
         update_key_f64(&mut fptr, "CRPIX2", crpix2 - bb.xmin as f64)?;
     }
 
-    let plane_len = dims[0] * dims.get(1).copied().unwrap_or(1);
     let layout = extract_header_layout(&mut fptr, &dims)?;
     Ok((
         InitResult {
-            pixel_type: PixelType::from_bitpix(out_bitpix),
-            plane_len,
+            bitpix: out_bitpix,
+            plane_len: dims[..fi - 1].iter().product(),
         },
         layout,
     ))
 }
 
-/// Read one input plane as type `T`, apply bounding box / zero-invalidation, and
-/// return the flat (row-major) plane buffer ready for `write_section`.
+/// Slice every 2D plane of an input (rows xmin:xmax, cols ymin:ymax, matching
+/// numpy `[..., x, y]`) down to the bounding box.
+fn crop_to_box<T: Clone>(
+    flat: &[T],
+    nrows: usize,
+    ncols: usize,
+    bb: &BoundingBox,
+) -> Result<Vec<T>> {
+    let mut out = Vec::with_capacity(flat.len() / (nrows * ncols) * bb.x_span * bb.y_span);
+    for plane in flat.chunks(nrows * ncols) {
+        let view = ArrayView2::from_shape((nrows, ncols), plane)?;
+        let sub = view.slice(ndarray::s![bb.xmin..bb.xmax, bb.ymin..bb.ymax]);
+        out.extend(sub.iter().cloned());
+    }
+    Ok(out)
+}
+
+/// NAXIS2 (rows) and NAXIS1 (cols) of the open image, for a bounding-box crop.
+fn plane_dims(fptr: &mut FitsFile) -> Result<(usize, usize)> {
+    let hdu = fptr.primary_hdu()?;
+    // FITS order: NAXIS1 = cols (fast), NAXIS2 = rows.
+    let ncols: i64 = hdu.read_key(fptr, "NAXIS1")?;
+    let nrows: i64 = hdu.read_key(fptr, "NAXIS2")?;
+    Ok((nrows as usize, ncols as usize))
+}
+
+/// Read one input image as type `T`, apply bounding box / zero-invalidation, and
+/// return the flat (row-major) buffer of every plane in it.
 fn process_plane<T: CubeElem + num_traits::Float>(
     path: &Path,
     bbox: Option<&BoundingBox>,
@@ -330,26 +430,12 @@ fn process_plane<T: CubeElem + num_traits::Float>(
     // Single open per plane. Only read the spatial dims (extra header keys) when
     // a bounding box actually needs them.
     let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let dims = if bbox.is_some() {
-        let hdu = fptr.primary_hdu()?;
-        // FITS order: NAXIS1 = cols (fast), NAXIS2 = rows.
-        let ncols: i64 = hdu.read_key(&mut fptr, "NAXIS1")?;
-        let nrows: i64 = hdu.read_key(&mut fptr, "NAXIS2")?;
-        Some((nrows as usize, ncols as usize))
-    } else {
-        None
-    };
+    let dims = bbox.map(|_| plane_dims(&mut fptr)).transpose()?;
     let flat: Vec<T> = T::read_full(&mut fptr)?;
 
-    let mut plane: Vec<T> = if let Some(bb) = bbox {
-        let (nrows, ncols) = dims.expect("dims read when bbox is set");
-        let view: ArrayView2<T> = ArrayView2::from_shape((nrows, ncols), &flat)?;
-        // Slice rows xmin:xmax, cols ymin:ymax (matches numpy `[..., x, y]`).
-        let sub = view.slice(ndarray::s![bb.xmin..bb.xmax, bb.ymin..bb.ymax]);
-        let owned: Array2<T> = sub.to_owned();
-        owned.into_raw_vec_and_offset().0
-    } else {
-        flat
+    let mut plane: Vec<T> = match (bbox, dims) {
+        (Some(bb), Some((nrows, ncols))) => crop_to_box(&flat, nrows, ncols, bb)?,
+        _ => flat,
     };
 
     if invalidate_zeros {
@@ -364,32 +450,86 @@ fn process_plane<T: CubeElem + num_traits::Float>(
     Ok(plane)
 }
 
+/// Read one integer input image as its raw stored values (BSCALE/BZERO not
+/// applied), cropped to any bounding box.
+///
+/// The cube keeps the first input's BITPIX, BSCALE and BZERO, so copying the
+/// stored integers is lossless, where decoding through floats and re-encoding
+/// would not be.
+fn process_plane_raw_int(path: &Path, bbox: Option<&BoundingBox>) -> Result<Vec<i64>> {
+    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
+    let dims = plane_dims(&mut fptr)?;
+    let n: usize = HeaderGeom::read(path)?.dims.iter().product();
+    let mut flat = vec![0i64; n];
+    let mut anynul = 0;
+    let mut status = 0;
+    // SAFETY: `fptr` is an open image positioned on its primary HDU, and `flat`
+    // holds exactly the `n` elements requested.
+    unsafe {
+        fitsio::sys::ffpscl(fptr.as_raw(), 1.0, 0.0, &mut status);
+        fitsio::sys::ffgpvjj(
+            fptr.as_raw(),
+            0,
+            1,
+            n as _,
+            0,
+            flat.as_mut_ptr(),
+            &mut anynul,
+            &mut status,
+        );
+    }
+    if status != 0 {
+        return Err(FitsCubeError::Other(format!(
+            "cfitsio error {status} reading raw integers from {}",
+            path.display()
+        )));
+    }
+    match bbox {
+        Some(bb) => crop_to_box(&flat, dims.0, dims.1, bb),
+        None => Ok(flat),
+    }
+}
+
+/// Serialise a plane to big-endian FITS bytes.
+fn encode_be<T: BeBytes>(data: &[T]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data.len() * T::WIDTH);
+    for &v in data {
+        v.extend_be(&mut buf);
+    }
+    buf
+}
+
+/// Serialise raw integers to big-endian FITS bytes at the width of `bitpix`.
+fn encode_int_be(data: &[i64], bitpix: i64) -> Vec<u8> {
+    match bitpix {
+        8 => data.iter().map(|&v| v as u8).collect(),
+        16 => encode_be(&data.iter().map(|&v| v as i16).collect::<Vec<_>>()),
+        32 => encode_be(&data.iter().map(|&v| v as i32).collect::<Vec<_>>()),
+        _ => encode_be(data),
+    }
+}
+
 /// Stream all channels into the output cube using raw I/O.
 ///
 /// Bypasses cfitsio for the data unit: the file is created with the prebuilt
 /// header ([`CubeLayout`]) and sparsely extended to its final length, then each
-/// decoded plane is byte-swapped to big-endian ([`BeBytes`]) and written at its
-/// offset. This mirrors the Python reference (`astype(">f4")` + raw `tofile`),
-/// which is markedly faster than cfitsio's per-block write path and never pays
-/// the zero-fill pass cfitsio does on close.
+/// channel's big-endian bytes from `encode_channel` are written at its offset.
+/// This mirrors the Python reference (`astype(">f4")` + raw `tofile`), which is
+/// markedly faster than cfitsio's per-block write path and never pays the
+/// zero-fill pass cfitsio does on close.
 ///
-/// Planes are decoded by the rayon pool (parallel readers) and written on this
-/// single thread; `write_all_at` is positional, so out-of-order arrival is fine.
-#[allow(clippy::too_many_arguments)]
-fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
+/// Channels are decoded and byte-swapped by the rayon pool (parallel readers)
+/// and written on this single thread; `write_all_at` is positional, so
+/// out-of-order arrival is fine.
+fn write_cube_raw(
     out_cube: &Path,
     layout: &CubeLayout,
-    file_list: &[PathBuf],
-    new_to_old: &[Option<usize>],
-    plane_len: usize,
-    bbox: Option<&BoundingBox>,
-    invalidate_zeros: bool,
+    n_chan: usize,
+    plane_bytes: u64,
+    encode_channel: impl Fn(usize) -> Result<Vec<u8>> + Sync,
     max_workers: Option<usize>,
     progress: bool,
 ) -> Result<()> {
-    let n_chan = new_to_old.len();
-    let plane_bytes = (plane_len * T::WIDTH) as u64;
-
     // Lay down the header and size the file. `set_len` past the header leaves the
     // data unit (and its 2880-padded tail) sparse — zero-backed on demand — so no
     // zeros are physically written; the planes below cover the real data.
@@ -409,18 +549,22 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
         .map(|n| n.get() * 2)
         .unwrap_or(8);
     let bound = max_workers.unwrap_or(default_bound).max(1);
-    let (tx, rx) = sync_channel::<(usize, Vec<T>)>(bound);
+    let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(bound);
 
     std::thread::scope(|scope| -> Result<()> {
+        let encode_channel = &encode_channel;
         let producer = scope.spawn(move || -> Result<()> {
             let res = (0..n_chan)
                 .into_par_iter()
                 .try_for_each(|new_chan| -> Result<()> {
-                    let plane = match new_to_old[new_chan] {
-                        Some(old) => process_plane::<T>(&file_list[old], bbox, invalidate_zeros)?,
-                        None => vec![T::nan(); plane_len], // missing → blank plane
-                    };
-                    tx.send((new_chan, plane))
+                    let bytes = encode_channel(new_chan)?;
+                    if bytes.len() as u64 != plane_bytes {
+                        return Err(FitsCubeError::Other(format!(
+                            "channel {new_chan} holds {} bytes, but the cube expects {plane_bytes}",
+                            bytes.len()
+                        )));
+                    }
+                    tx.send((new_chan, bytes))
                         .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
                     Ok(())
                 });
@@ -428,20 +572,15 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
             res
         });
 
-        // Writer (this thread): byte-swap each plane and write it at its offset.
+        // Writer (this thread): write each channel at its offset.
         let pb = progress.then(|| {
             let bar = progress_bar(n_chan as u64);
             bar.set_message("writing planes");
             bar
         });
-        let mut buf: Vec<u8> = Vec::with_capacity(plane_bytes as usize);
-        for (chan, data) in rx {
-            buf.clear();
-            for v in &data {
-                v.extend_be(&mut buf);
-            }
+        for (chan, bytes) in rx {
             let offset = layout.datastart + chan as u64 * plane_bytes;
-            file.write_all_at(&buf, offset)?;
+            file.write_all_at(&bytes, offset)?;
             if let Some(bar) = &pb {
                 bar.inc(1);
             }
@@ -453,6 +592,19 @@ fn write_cube_raw<T: CubeElem + num_traits::Float + BeBytes>(
         producer
             .join()
             .map_err(|_| FitsCubeError::Other("reader thread panicked".to_string()))?
+    })
+}
+
+/// Encode one float channel: the input plane in `T`, or NaNs for a blank one.
+fn encode_float_channel<T: CubeElem + num_traits::Float + BeBytes>(
+    input: Option<&Path>,
+    plane_len: usize,
+    bbox: Option<&BoundingBox>,
+    invalidate_zeros: bool,
+) -> Result<Vec<u8>> {
+    Ok(match input {
+        Some(path) => encode_be(&process_plane::<T>(path, bbox, invalidate_zeros)?),
+        None => encode_be(&vec![T::nan(); plane_len]),
     })
 }
 
@@ -484,16 +636,6 @@ pub fn combine_fits(
         options.time_domain_mode,
     )?;
 
-    // Beams (parsed in input order, matching the original).
-    let has_beams = has_key(&file_list[0], "BMAJ")?;
-    let (beams_vec, single_beam): (Option<Vec<Beam>>, bool) = if has_beams {
-        let beams = beams::parse_beams(file_list)?;
-        let single = beams::is_single_beam(&beams);
-        (Some(beams), single)
-    } else {
-        (None, false)
-    };
-
     // Sort files by their per-file value; sort the output axis independently.
     let old_sort = argsort(&spec_info.file_specs);
     let sorted_files: Vec<PathBuf> = old_sort.iter().map(|&i| file_list[i].clone()).collect();
@@ -502,31 +644,79 @@ pub fn combine_fits(
     let specs: Vec<f64> = new_sort.iter().map(|&i| spec_info.specs[i]).collect();
     let missing: Vec<bool> = new_sort.iter().map(|&i| spec_info.missing[i]).collect();
 
-    // Optional common bounding box (computed from the sorted files).
-    let final_bbox: Option<BoundingBox> = if options.bounding_box {
+    // Beams are parsed after sorting so that they follow the channel order of
+    // the output cube, not the order the files were given in. Any input with a
+    // beam counts, not just the first.
+    let has_beams = beams::check_for_any_beam(&sorted_files)?;
+    let mut zero_beam = vec![false; specs.len()];
+    let (beams_vec, single_beam): (Option<Vec<Beam>>, bool) = if has_beams {
+        let mut beams = beams::expand_beams(&beams::parse_beams(&sorted_files)?, &missing);
+        let found_zero_beams = beams::find_zero_beams(&beams);
+        if found_zero_beams.iter().any(|&z| z) {
+            // Keep the message readable when a whole run has zero beams
+            let all_zero_chans: Vec<usize> = found_zero_beams
+                .iter()
+                .enumerate()
+                .filter_map(|(chan, &z)| z.then_some(chan))
+                .collect();
+            let zero_chans = if all_zero_chans.len() > 10 {
+                format!(
+                    "{:?} (and {} more)",
+                    &all_zero_chans[..10],
+                    all_zero_chans.len() - 10
+                )
+            } else {
+                format!("{all_zero_chans:?}")
+            };
+            if options.blank_zero_beams {
+                tracing::warn!(
+                    "Channels {zero_chans} have a restoring beam of exactly zero. These \
+                     planes carry no real PSF (e.g. a wsclean model image from \
+                     -fit-spectral-pol) and are being blanked with NaNs. Pass \
+                     --no-blank-zero-beams (blank_zero_beams=False) to keep them."
+                );
+                beams = beams::nan_zero_beams(&beams, &found_zero_beams);
+                zero_beam = found_zero_beams;
+            } else {
+                tracing::warn!(
+                    "Channels {zero_chans} have a restoring beam of exactly zero, but \
+                     blank_zero_beams is off, so they are being kept as-is."
+                );
+            }
+        }
+        let single = beams::is_single_beam(&beams);
+        (Some(beams), single)
+    } else {
+        (None, false)
+    };
+
+    // Optional common bounding box. A caller supplied box is used as is, so that
+    // separate cubes can be forced onto a common pixel grid.
+    let final_bbox: Option<BoundingBox> = if let Some(bb) = options.supplied_bounding_box {
+        let (ncols, nrows) = input_axes[0].shape;
+        let grid = (nrows as usize, ncols as usize);
+        if bb.original_shape != grid || bb.xmax > grid.0 || bb.ymax > grid.1 {
+            return Err(FitsCubeError::ShapeMismatch(format!(
+                "The supplied bounding box {bb:?} does not fit the input images, whose \
+                 planes have shape (NAXIS2, NAXIS1)={grid:?}"
+            )));
+        }
+        Some(bb)
+    } else if options.bounding_box {
         let spin = options
             .progress
             .then(|| spinner("solving for common bounding box"));
-        let boxes: Vec<Option<BoundingBox>> = sorted_files
-            .par_iter()
-            .map(|p| -> Result<Option<BoundingBox>> {
-                let plane = process_plane::<f64>(p, None, options.invalidate_zeros)?;
-                let geom = HeaderGeom::read(p)?;
-                let ncols = geom.dims.first().copied().unwrap_or(1);
-                let nrows = geom.dims.get(1).copied().unwrap_or(1);
-                let view = ArrayView2::from_shape((nrows, ncols), &plane)?;
-                Ok(create_bound_box_plane(&view))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let bb = extract_common_bounding_box(&boxes)?;
+        let bb = get_common_bounding_box(&sorted_files, options.invalidate_zeros)?;
         if let Some(spin) = spin {
             spin.finish_and_clear();
         }
-        tracing::info!("The final bounding box is: {bb:?}");
         Some(bb)
     } else {
         None
     };
+    if let Some(bb) = &final_bbox {
+        tracing::info!("The final bounding box is: {bb:?}");
+    }
 
     // Lay out the beam table's POL column before writing any data, so an
     // unsupported cube (e.g. multi-Stokes) fails before the planes are copied
@@ -569,30 +759,60 @@ pub fn combine_fits(
         )));
     }
 
+    // Blank channels, zero-beam planes and invalidated zeros are all NaNs,
+    // which an integer cube cannot hold.
+    let blank_channels = missing.iter().zip(&zero_beam).any(|(&m, &z)| m || z);
+    if init.bitpix > 0 && (blank_channels || options.invalidate_zeros) {
+        return Err(FitsCubeError::Other(format!(
+            "Blank channels and invalidated zeros are written as NaNs, which integer \
+             output data (BITPIX={}) cannot hold. Pass float_length=32 or 64 (--floating).",
+            init.bitpix
+        )));
+    }
+
+    // Input image of each output channel; None ⇒ a blank (NaN) plane.
+    let inputs: Vec<Option<&Path>> = new_to_old
+        .iter()
+        .zip(&zero_beam)
+        .map(|(old, &z)| old.filter(|_| !z).map(|i| sorted_files[i].as_path()))
+        .collect();
+    let bbox = final_bbox.as_ref();
+    let plane_len = init.plane_len;
+    let width = (init.bitpix.unsigned_abs() / 8) as usize;
+    let plane_bytes = (plane_len * width) as u64;
+    let write = |encode: &(dyn Fn(usize) -> Result<Vec<u8>> + Sync)| {
+        write_cube_raw(
+            out_cube,
+            &layout,
+            inputs.len(),
+            plane_bytes,
+            encode,
+            options.max_workers,
+            options.progress,
+        )
+    };
+
     // Stream planes in the output precision.
-    match init.pixel_type {
-        PixelType::F32 => write_cube_raw::<f32>(
-            out_cube,
-            &layout,
-            &sorted_files,
-            &new_to_old,
-            init.plane_len,
-            final_bbox.as_ref(),
-            options.invalidate_zeros,
-            options.max_workers,
-            options.progress,
-        )?,
-        PixelType::F64 => write_cube_raw::<f64>(
-            out_cube,
-            &layout,
-            &sorted_files,
-            &new_to_old,
-            init.plane_len,
-            final_bbox.as_ref(),
-            options.invalidate_zeros,
-            options.max_workers,
-            options.progress,
-        )?,
+    match init.bitpix {
+        -32 => write(&|chan| {
+            encode_float_channel::<f32>(inputs[chan], plane_len, bbox, options.invalidate_zeros)
+        })?,
+        -64 => write(&|chan| {
+            encode_float_channel::<f64>(inputs[chan], plane_len, bbox, options.invalidate_zeros)
+        })?,
+        8 | 16 | 32 | 64 => write(&|chan| {
+            // Integer cubes never have blank channels (checked above)
+            let path = inputs[chan].expect("integer cubes have no blank channels");
+            Ok(encode_int_be(
+                &process_plane_raw_int(path, bbox)?,
+                init.bitpix,
+            ))
+        })?,
+        other => {
+            return Err(FitsCubeError::Other(format!(
+                "unsupported output BITPIX={other}"
+            )));
+        }
     }
 
     // Append the per-channel beam table when beams vary.

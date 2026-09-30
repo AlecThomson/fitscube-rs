@@ -9,7 +9,7 @@ use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::read_key_f64;
+use crate::fits_io::{has_key, read_key_f64};
 
 /// A restoring beam in degrees. Any field may be NaN (no beam in header).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,9 +38,88 @@ pub fn read_beam(path: &Path) -> Result<Beam> {
     })
 }
 
+/// Whether any input has a beam (BMAJ) in its header. Mirrors
+/// `check_for_any_beam`: stops at the first file that has one.
+pub fn check_for_any_beam(file_list: &[PathBuf]) -> Result<bool> {
+    for path in file_list {
+        if has_key(path, "BMAJ")? {
+            tracing::info!("Found beam properties in {}", path.display());
+            return Ok(true);
+        }
+    }
+    // No beams were found among any of the inputs, so no beam information can
+    // be recorded in the output
+    Ok(false)
+}
+
 /// Read one beam per file.
 pub fn parse_beams(file_list: &[PathBuf]) -> Result<Vec<Beam>> {
     file_list.iter().map(|p| read_beam(p)).collect()
+}
+
+/// Place per-file beams onto the output channel grid, NaN for blank channels.
+/// Mirrors `expand_beams`.
+///
+/// `beams` holds one beam per input file, in output channel order; `missing`
+/// flags the blank channels of the output cube.
+pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Vec<Beam> {
+    let nan = Beam {
+        major_deg: f64::NAN,
+        minor_deg: f64::NAN,
+        pa_deg: f64::NAN,
+    };
+    let mut present = beams.iter();
+    let expanded: Vec<Beam> = missing
+        .iter()
+        .map(|&m| {
+            if m {
+                nan
+            } else {
+                *present.next().unwrap_or(&nan)
+            }
+        })
+        .collect();
+    assert_eq!(
+        missing.iter().filter(|&&m| !m).count(),
+        beams.len(),
+        "Have {} beams for the populated channels of {}",
+        beams.len(),
+        missing.len()
+    );
+    expanded
+}
+
+/// Channels whose restoring beam is exactly zero. Mirrors `find_zero_beams`.
+///
+/// A zero-sized beam is not a real PSF. wsclean writes one when a plane carries
+/// no fitted beam at all — most notably the model image that
+/// `-fit-spectral-pol` plants into an otherwise empty channel. NaN beams (blank
+/// channels, missing BMAJ) are handled elsewhere, and `NaN == 0.0` is false, so
+/// they never appear here. A zero position angle is legitimate.
+pub fn find_zero_beams(beams: &[Beam]) -> Vec<bool> {
+    beams
+        .iter()
+        .map(|b| b.major_deg == 0.0 || b.minor_deg == 0.0)
+        .collect()
+}
+
+/// Replace the flagged beams with NaN beams. Mirrors `nan_zero_beams`.
+pub fn nan_zero_beams(beams: &[Beam], zero_beam: &[bool]) -> Vec<Beam> {
+    beams
+        .iter()
+        .zip(zero_beam)
+        .map(|(&b, &zero)| {
+            if zero {
+                Beam {
+                    major_deg: f64::NAN,
+                    minor_deg: f64::NAN,
+                    pa_deg: f64::NAN,
+                }
+            } else {
+                b
+            }
+        })
+        .collect()
 }
 
 /// `numpy.isclose` with the default tolerances (`rtol = 1e-5`, `atol = 1e-8`).
@@ -105,6 +184,11 @@ pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32])
     let pol = beam_table_pol(stokes_idx)?;
     let tiny = f32::MIN_POSITIVE;
     let nchan = beams.len();
+    // A zero-sized beam is not a valid PSF, and a literal zero is exactly what
+    // the sentinel below exists to keep out of the table. NaN them first so they
+    // pick up the sentinel too. This is done per-beam rather than per-column: a
+    // zero BPA on an otherwise real beam is perfectly legitimate.
+    let beams = nan_zero_beams(beams, &find_zero_beams(beams));
 
     let nan_to_tiny = |v: f32| if v.is_nan() { tiny } else { v };
 
@@ -188,6 +272,38 @@ mod tests {
         assert_eq!(beam_table_pol(&get_polarisation(Some(1))).unwrap(), 0);
         let err = beam_table_pol(&get_polarisation(Some(3))).unwrap_err();
         assert!(matches!(err, FitsCubeError::NotImplemented(_)), "{err:?}");
+    }
+
+    #[test]
+    fn expand_beams_blanks_missing_channels() {
+        let beams = vec![b(1.0, 1.0, 0.0), b(2.0, 2.0, 0.0)];
+        let expanded = expand_beams(&beams, &[false, true, false]);
+        assert_eq!(expanded[0], beams[0]);
+        assert!(expanded[1].is_nan());
+        assert_eq!(expanded[2], beams[1]);
+    }
+
+    #[test]
+    fn find_zero_beams_ignores_nan_and_zero_pa() {
+        let beams = vec![
+            b(1.0, 1.0, 0.0),
+            b(0.0, 0.0, 0.0),
+            b(2.0, 0.0, 0.0),
+            b(f64::NAN, f64::NAN, f64::NAN),
+        ];
+        // A zero major or a zero minor is degenerate; a NaN beam is not a zero
+        // beam, and a zero position angle is perfectly legitimate.
+        assert_eq!(find_zero_beams(&beams), vec![false, true, true, false]);
+    }
+
+    #[test]
+    fn nan_zero_beams_blanks_only_flagged() {
+        let beams = vec![b(1.0, 1.0, 10.0), b(0.0, 0.0, 0.0)];
+        let blanked = nan_zero_beams(&beams, &[false, true]);
+        assert_eq!(blanked[0], beams[0]);
+        assert!(blanked[1].major_deg.is_nan());
+        assert!(blanked[1].minor_deg.is_nan());
+        assert!(blanked[1].pa_deg.is_nan());
     }
 
     #[test]

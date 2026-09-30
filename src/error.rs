@@ -61,6 +61,18 @@ pub enum FitsCubeError {
     #[error("Stokes mismatch: {0}")]
     StokesMismatch(String),
 
+    /// The combine axis is not the slowest-varying axis of the cube.
+    ///
+    /// Equivalent to Python `AxisOrderException`.
+    #[error("axis order: {0}")]
+    AxisOrder(String),
+
+    /// A regular grid through the inputs would drop some of them.
+    ///
+    /// Equivalent to Python `IrregularSpacingException`.
+    #[error("irregular spacing: {0}")]
+    IrregularSpacing(String),
+
     /// A valid input the port does not support yet (e.g. multi-Stokes beams).
     ///
     /// Equivalent to Python `NotImplementedError`.

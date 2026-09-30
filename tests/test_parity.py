@@ -8,7 +8,7 @@ bug in `fitscube_rs`.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,9 +16,6 @@ from astropy.io import fits
 from packaging.version import Version
 
 import fitscube_rs
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 # The reference implementation. Skip the whole module if it is not installed.
 fitscube = pytest.importorskip("fitscube")
@@ -159,13 +156,6 @@ def test_varying_beams_beam_table(tmp_path):
             )
 
 
-# The first release whose BEAMS POL column is a 0-based Stokes axis index.
-_POL_FIX_VERSION = Version("2.8.0")
-_fitscube_has_pol_fix = Version(
-    fitscube.__version__.split("+")[0].split(".dev")[0]
-) >= (_POL_FIX_VERSION)
-
-
 def _make_stokes_images(d: Path, freqs, beams, stokes_code: float) -> list[Path]:
     """wsclean-order (RA, DEC, FREQ, STOKES) single-plane images."""
     d.mkdir(parents=True, exist_ok=True)
@@ -194,19 +184,12 @@ def test_single_stokes_beam_table_pol(tmp_path, stokes_code):
     rs_cube = tmp_path / "rs_cube.fits"
     fitscube_rs.combine_fits([str(f) for f in rs_files], str(rs_cube), overwrite=True)
 
-    # Correctness (always)
     with fits.open(rs_cube) as hdul:
         assert hdul[0].header["CRVAL4"] == stokes_code
         assert hdul["BEAMS"].header["NPOL"] == 1
         assert hdul["BEAMS"].data["POL"].tolist() == [0, 0, 0]
         assert hdul["BEAMS"].data["CHAN"].tolist() == [0, 1, 2]
 
-    # Parity (only when the reference carries the POL fix)
-    if not _fitscube_has_pol_fix:
-        pytest.skip(
-            f"fitscube {fitscube.__version__} predates the BEAMS POL fix "
-            f"(>= {_POL_FIX_VERSION}); skipping cross-check"
-        )
     ref_files = _make_stokes_images(tmp_path / "ref", freqs, beams, stokes_code)
     ref_cube = tmp_path / "ref_cube.fits"
     fitscube.combine_fits(file_list=ref_files, out_cube=ref_cube, overwrite=True)
@@ -344,3 +327,214 @@ def test_extract_matches_input_plane(tmp_path):
         data = np.squeeze(hdul[0].data)
         # Channel 2 was filled with value 3.0 (fill = i + 1).
         np.testing.assert_allclose(data, 3.0, rtol=1e-6)
+
+
+def _write_plane(
+    path: Path,
+    freq: float,
+    fill: float,
+    *,
+    beam: float | None = None,
+    dtype=np.float32,
+) -> Path:
+    """A (FREQ, STOKES, DEC, RA) single-channel image, the usual ASKAP layout."""
+    header = fits.Header()
+    header["CTYPE1"], header["CRPIX1"], header["CRVAL1"] = "RA---SIN", 1.0, 0.0
+    header["CDELT1"], header["CUNIT1"] = -1.0 / 3600.0, "deg"
+    header["CTYPE2"], header["CRPIX2"], header["CRVAL2"] = "DEC--SIN", 1.0, 0.0
+    header["CDELT2"], header["CUNIT2"] = 1.0 / 3600.0, "deg"
+    header["CTYPE3"], header["CRPIX3"], header["CRVAL3"] = "STOKES", 1.0, 1.0
+    header["CDELT3"] = 1.0
+    header["CTYPE4"], header["CRPIX4"], header["CRVAL4"] = "FREQ", 1.0, freq
+    header["CDELT4"], header["CUNIT4"] = 1.0e6, "Hz"
+    if beam is not None:
+        header["BMAJ"], header["BMIN"], header["BPA"] = beam, beam / 2, 0.0
+    data = np.full((1, 1, 30, 30), fill, dtype=dtype)
+    fits.PrimaryHDU(data, header=header).writeto(path, overwrite=True)
+    return path
+
+
+def _combine_both(tmp_path: Path, make, **kwargs) -> tuple[Path, Path]:
+    """Combine the same inputs with fitscube and fitscube_rs."""
+    cubes = []
+    for name, combine in (
+        ("ref", fitscube.combine_fits),
+        ("rs", fitscube_rs.combine_fits),
+    ):
+        d = tmp_path / name
+        d.mkdir()
+        cube = tmp_path / f"{name}_cube.fits"
+        # The reference takes Paths; fitscube_rs takes any path-like
+        combine(
+            file_list=[Path(f) for f in make(d)],
+            out_cube=cube,
+            overwrite=True,
+            **kwargs,
+        )
+        cubes.append(cube)
+    return cubes[0], cubes[1]
+
+
+def _compare_full(ref: Path, rs: Path) -> None:
+    """Data (NaNs included), dtype, and every BEAMS column and count."""
+    with fits.open(ref) as ref_hdul, fits.open(rs) as rs_hdul:
+        ref_data, rs_data = ref_hdul[0].data, rs_hdul[0].data
+        assert rs_data.shape == ref_data.shape
+        assert rs_data.dtype == ref_data.dtype
+        np.testing.assert_array_equal(np.isnan(rs_data), np.isnan(ref_data))
+        np.testing.assert_allclose(
+            np.nan_to_num(rs_data), np.nan_to_num(ref_data), rtol=1e-6
+        )
+        ref_names = [hdu.name for hdu in ref_hdul]
+        assert [hdu.name for hdu in rs_hdul] == ref_names
+        if "BEAMS" not in ref_names:
+            return
+        ref_beams, rs_beams = ref_hdul["BEAMS"], rs_hdul["BEAMS"]
+        for key in ("NCHAN", "NPOL"):
+            assert rs_beams.header[key] == ref_beams.header[key], key
+        for col in ("BMAJ", "BMIN", "BPA"):
+            np.testing.assert_allclose(
+                rs_beams.data[col], ref_beams.data[col], rtol=1e-6, err_msg=col
+            )
+        for col in ("CHAN", "POL"):
+            assert rs_beams.data[col].tolist() == ref_beams.data[col].tolist(), col
+
+
+def test_unsorted_beams_follow_channels_and_blanks(tmp_path):
+    """Beams are sorted with the planes and padded over blank channels."""
+    freqs = [1.004e9, 1.0e9, 1.003e9, 1.001e9]  # unsorted, 1.002 GHz missing
+
+    def make(d: Path) -> list[str]:
+        return [
+            str(_write_plane(d / f"p{i}.fits", f, float(i), beam=(f - 0.99e9) / 1e10))
+            for i, f in enumerate(freqs)
+        ]
+
+    ref, rs = _combine_both(tmp_path, make, create_blanks=True)
+    _compare_full(ref, rs)
+
+
+def test_beam_not_in_first_file(tmp_path):
+    def make(d: Path) -> list[str]:
+        return [
+            str(
+                _write_plane(
+                    d / f"p{i}.fits", 1e9 + i * 1e6, float(i), beam=1e-3 if i else None
+                )
+            )
+            for i in range(4)
+        ]
+
+    ref, rs = _combine_both(tmp_path, make)
+    _compare_full(ref, rs)
+
+
+@pytest.mark.parametrize("blank_zero_beams", [True, False])
+def test_zero_beams(tmp_path, blank_zero_beams):
+    """wsclean -fit-spectral-pol model planes carry an exactly-zero beam."""
+
+    def make(d: Path) -> list[str]:
+        return [
+            str(
+                _write_plane(
+                    d / f"p{i}.fits",
+                    1e9 + i * 1e6,
+                    float(i + 1),
+                    beam=0.0 if i == 1 else 1e-3 * (i + 1),
+                )
+            )
+            for i in range(4)
+        ]
+
+    ref, rs = _combine_both(tmp_path, make, blank_zero_beams=blank_zero_beams)
+    _compare_full(ref, rs)
+
+
+def test_integer_input(tmp_path):
+    def make(d: Path) -> list[str]:
+        return [
+            str(_write_plane(d / f"p{i}.fits", 1e9 + i * 1e6, i, dtype=np.int16))
+            for i in range(4)
+        ]
+
+    ref, rs = _combine_both(tmp_path, make)
+    assert fits.getheader(rs)["BITPIX"] == 16
+    _compare_full(ref, rs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "error"),
+    [
+        # Irregular frequencies cannot be gridded without dropping inputs
+        ({"create_blanks": True}, "would drop inputs"),
+    ],
+)
+def test_irregular_spacing_raises(tmp_path, kwargs, error):
+    freqs = 1e9 + np.array([0.0, 2.302585, 2.718281, 2.828427, 3.141592]) * 1e7
+
+    def make(d: Path) -> list[str]:
+        return [
+            str(_write_plane(d / f"p{i}.fits", f, float(i)))
+            for i, f in enumerate(freqs)
+        ]
+
+    for combine in (fitscube.combine_fits, fitscube_rs.combine_fits):
+        d = tmp_path / combine.__module__
+        d.mkdir()
+        with pytest.raises(Exception, match=error):
+            combine(
+                file_list=[Path(f) for f in make(d)],
+                out_cube=tmp_path / "c.fits",
+                **kwargs,
+            )
+
+
+def test_supplied_bounding_box(tmp_path):
+    """A common box forces an image cube and its weights onto one grid."""
+
+    def make_images(d: Path) -> list[str]:
+        files = []
+        for i in range(4):
+            path = _write_plane(d / f"image_{i}.fits", 1e9 + i * 1e6, float(i))
+            with fits.open(path, mode="update") as hdul:
+                hdul[0].data[..., : i + 3, :] = np.nan
+                hdul[0].data[..., :, 25:] = np.nan
+            files.append(str(path))
+        return files
+
+    (tmp_path / "images").mkdir()
+    images = make_images(tmp_path / "images")
+    ref_box = fitscube.get_common_bounding_box(file_list=[Path(f) for f in images])
+    rs_box = fitscube_rs.get_common_bounding_box(images)
+    for attr in ("xmin", "xmax", "ymin", "ymax", "x_span", "y_span"):
+        assert getattr(rs_box, attr) == getattr(ref_box, attr), attr
+    assert rs_box.original_shape == tuple(ref_box.original_shape)
+    assert rs_box == fitscube_rs.BoundingBox(
+        rs_box.xmin, rs_box.xmax, rs_box.ymin, rs_box.ymax, rs_box.original_shape
+    )
+
+    def make_weights(d: Path) -> list[str]:
+        return [
+            str(_write_plane(d / f"weight_{i}.fits", 1e9 + i * 1e6, 1.0))
+            for i in range(4)
+        ]
+
+    ref_cube = tmp_path / "ref_weights.fits"
+    rs_cube = tmp_path / "rs_weights.fits"
+    (tmp_path / "ref").mkdir()
+    (tmp_path / "rs").mkdir()
+    fitscube.combine_fits(
+        file_list=[Path(f) for f in make_weights(tmp_path / "ref")],
+        out_cube=ref_cube,
+        bounding_box=ref_box,
+    )
+    fitscube_rs.combine_fits(
+        make_weights(tmp_path / "rs"), rs_cube, bounding_box=rs_box
+    )
+    _compare_full(ref_cube, rs_cube)
+    for key in ("NAXIS1", "NAXIS2", "CRPIX1", "CRPIX2"):
+        assert fits.getheader(rs_cube)[key] == fits.getheader(ref_cube)[key], key
+    # The weights alone would not have been trimmed
+    assert (
+        fitscube_rs.get_common_bounding_box(make_weights(tmp_path / "rs")).x_span == 30
+    )

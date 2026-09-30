@@ -72,6 +72,11 @@ struct CombineArgs {
     /// Output float precision in bits (32 or 64). Defaults to the input.
     #[arg(long, value_parser = ["32", "64"])]
     floating: Option<String>,
+    /// Keep images whose restoring beam is exactly zero. By default such images
+    /// are blanked with NaNs, as a zero beam means no PSF was fitted for that
+    /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
+    #[arg(long)]
+    no_blank_zero_beams: bool,
 }
 
 #[derive(Args)]
@@ -131,8 +136,10 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         max_workers: args.max_workers,
         time_domain_mode: args.time_domain,
         bounding_box: args.bounding_box,
+        supplied_bounding_box: None,
         invalidate_zeros: args.invalidate_zeros,
         float_length: args.floating.as_deref().map(|s| s.parse().unwrap()),
+        blank_zero_beams: !args.no_blank_zero_beams,
         // CLI: show progress bars on stderr.
         progress: true,
     };
