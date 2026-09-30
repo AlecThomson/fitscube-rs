@@ -12,11 +12,12 @@
 //! - [`extract_plane_from_cube`]: pull one channel/timestep back out of a cube
 //!   ([`extract`] module).
 //!
-//! Assumptions (inherited from the original): all inputs share the same WCS and
-//! pixel grid, and the frequency/time of each image is available either as a WCS
+//! Assumptions (inherited from the original): all inputs share the same WCS,
+//! pixel grid, axes and Stokes parameter (the last three are checked), and the frequency/time of each image is available either as a WCS
 //! axis, the `REFFREQ` keyword, or the `DATE-OBS` keyword (time mode).
 pub mod beams;
 pub mod bounding_box;
+pub mod checks;
 pub mod combine;
 pub mod error;
 pub mod extract;

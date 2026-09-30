@@ -17,6 +17,7 @@ use rayon::prelude::*;
 
 use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, create_bound_box_plane, extract_common_bounding_box};
+use crate::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use crate::error::{FitsCubeError, Result};
 use crate::fits_io::{
     CubeElem, CubeLayout, HeaderGeom, PixelType, create_mem_cube, delete_key,
@@ -468,6 +469,12 @@ pub fn combine_fits(
     // Validate precision early.
     float_length_to_bitpix(options.float_length)?;
 
+    // The cube's header comes from the first input, so every input must share
+    // its pixel grid, axes and Stokes parameter.
+    let input_axes = read_inputs_axes(file_list)?;
+    check_matching_shapes(file_list, &input_axes)?;
+    check_matching_axes(file_list, &input_axes)?;
+
     let spec_info = parse_specs(
         file_list,
         options.spec_file.as_deref(),
@@ -520,6 +527,14 @@ pub fn combine_fits(
     } else {
         None
     };
+
+    // Lay out the beam table's POL column before writing any data, so an
+    // unsupported cube (e.g. multi-Stokes) fails before the planes are copied
+    // in. Stokes is never the combine axis, so the cube keeps the inputs' one.
+    let stokes_idx = beams::get_polarisation(input_axes[0].stokes_codes.as_ref().map(Vec::len));
+    if has_beams && !single_beam {
+        beams::beam_table_pol(&stokes_idx)?;
+    }
 
     // Build the output header (in memory) and its on-disk byte layout.
     let (init, layout) = create_output_cube(
@@ -585,9 +600,8 @@ pub fn combine_fits(
         && !single_beam
         && let Some(beams) = beams_vec
     {
-        let pol = beams::get_polarisation(&sorted_files[0])?;
         let mut fptr = FitsFile::edit(out_cube.to_string_lossy().as_ref())?;
-        beams::write_beam_table(&mut fptr, &beams, pol)?;
+        beams::write_beam_table(&mut fptr, &beams, &stokes_idx)?;
     }
 
     Ok(specs)

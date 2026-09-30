@@ -14,8 +14,11 @@ channel (the default) or one time step (`--time-domain`). fitscube-rs reads the
 3D (or 4D, with a degenerate Stokes axis preserved) cube whose plane order
 follows the order the files are given.
 
-Every input is checked for a consistent shape and pixel grid; a plane that does
-not match the others is an error rather than a silent reshape. The spatial WCS
+Before any output is written, every input header is checked against the first:
+the same pixel grid (`NAXIS1`/`NAXIS2`), the same axes in the same order (the
+`CTYPE` of every axis), and the same Stokes parameter. The cube is labelled from
+the first image, so an input that differs is an error rather than a silently
+mislabelled or scrambled plane. The spatial WCS
 (`CRVAL1/2`, `CDELT1/2`, projection, …) is taken from the first image and
 carried onto the cube unchanged.
 
@@ -57,10 +60,13 @@ differs from plane to plane. fitscube-rs preserves this:
 - If all input planes share one beam, the single `BMAJ`/`BMIN`/`BPA` is written
   to the primary header.
 - If the beams differ across planes, fitscube-rs writes a CASA-style `BEAMS`
-  binary-table extension — one row per plane with that plane's beam (and its
-  channel/Stokes index) — and sets `CASAMBM=T` in the primary header. This is
+  binary-table extension — one row per plane with that plane's beam and its
+  `CHAN`/`POL`, which are 0-based indices into the cube's frequency (or time)
+  and Stokes axes, not FITS Stokes codes — and sets `CASAMBM=T` in the primary header. This is
   the multi-beam convention understood by CASA and `astropy`, so per-channel
-  beam information survives the round trip into the cube.
+  beam information survives the round trip into the cube. Only single-Stokes
+  cubes are supported (`POL = 0`, `NPOL = 1`); a multi-Stokes cube with
+  varying beams is refused before any data are written.
 
 ## Bounding-box trimming
 

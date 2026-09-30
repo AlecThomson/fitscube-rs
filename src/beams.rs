@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 
-use crate::error::Result;
-use crate::fits_io::{find_target_axis, read_key_f64};
+use crate::error::{FitsCubeError, Result};
+use crate::fits_io::read_key_f64;
 
 /// A restoring beam in degrees. Any field may be NaN (no beam in header).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,21 +68,41 @@ pub fn is_single_beam(beams: &[Beam]) -> bool {
     })
 }
 
-/// FITS polarisation index: `CRPIX − 1` of the STOKES axis, or 0 if absent.
-/// Mirrors `get_polarisation`.
-pub fn get_polarisation(path: &Path) -> Result<i32> {
-    match find_target_axis(path, "STOKES") {
-        Ok(axis) => Ok((axis.crpix - 1.0) as i32),
-        Err(_) => Ok(0),
+/// The 0-based plane indices along the Stokes axis. Mirrors `get_polarisation`.
+///
+/// These are the values the CASA beam table expects in its POL column: indices
+/// into the cube's Stokes axis, not FITS Stokes codes. `stokes_len` is the
+/// length of that axis, or `None` if there is no Stokes axis, which CASA counts
+/// as one Stokes plane in its beam set.
+pub fn get_polarisation(stokes_len: Option<usize>) -> Vec<i32> {
+    (0..stokes_len.unwrap_or(1) as i32).collect()
+}
+
+/// Check that a beam table can be written for a cube with these Stokes planes,
+/// returning the POL value of every row.
+///
+/// Only the single-Stokes case (POL = 0) is supported, as in `make_beam_table`.
+/// Call this before writing any data, so an unsupported cube fails before the
+/// planes are copied in.
+pub fn beam_table_pol(stokes_idx: &[i32]) -> Result<i32> {
+    match stokes_idx {
+        [pol] => Ok(*pol),
+        _ => Err(FitsCubeError::NotImplemented(format!(
+            "Only single-Stokes cubes are supported - found {} Stokes planes",
+            stokes_idx.len()
+        ))),
     }
 }
 
 /// Append a CASA `BEAMS` binary-table extension to an open output cube.
 ///
-/// Columns: BMAJ/BMIN [arcsec], BPA [deg], CHAN, POL. NaN beam values are
+/// Columns: BMAJ/BMIN [arcsec], BPA [deg], CHAN, POL. CHAN and POL are 0-based
+/// indices into the cube's frequency and Stokes axes (CASA convention), not
+/// FITS Stokes codes; `stokes_idx` comes from [`get_polarisation`]. NaN beam values are
 /// replaced with `f32::MIN_POSITIVE` (numpy `finfo(float32).tiny`) to keep CASA
 /// happy, exactly as `make_beam_table` does.
-pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], pol: i32) -> Result<()> {
+pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32]) -> Result<()> {
+    let pol = beam_table_pol(stokes_idx)?;
     let tiny = f32::MIN_POSITIVE;
     let nchan = beams.len();
 
@@ -126,7 +146,7 @@ pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], pol: i32) -> Result
 
     let beam_hdu = fptr.hdu("BEAMS")?;
     beam_hdu.write_key(fptr, "NCHAN", nchan as i64)?;
-    beam_hdu.write_key(fptr, "NPOL", 1i64)?;
+    beam_hdu.write_key(fptr, "NPOL", stokes_idx.len() as i64)?;
 
     Ok(())
 }
@@ -153,6 +173,21 @@ mod tests {
     fn varying_beams_are_not_single() {
         let beams = vec![b(1.0, 0.5, 10.0), b(1.1, 0.5, 10.0)];
         assert!(!is_single_beam(&beams));
+    }
+
+    #[test]
+    fn polarisation_is_axis_index() {
+        // POL values are 0-based indices along the Stokes axis, not Stokes codes
+        assert_eq!(get_polarisation(None), vec![0]);
+        assert_eq!(get_polarisation(Some(1)), vec![0]);
+        assert_eq!(get_polarisation(Some(3)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn beam_table_rejects_multi_stokes() {
+        assert_eq!(beam_table_pol(&get_polarisation(Some(1))).unwrap(), 0);
+        let err = beam_table_pol(&get_polarisation(Some(3))).unwrap_err();
+        assert!(matches!(err, FitsCubeError::NotImplemented(_)), "{err:?}");
     }
 
     #[test]

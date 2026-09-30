@@ -159,6 +159,70 @@ def test_varying_beams_beam_table(tmp_path):
             )
 
 
+# The first release whose BEAMS POL column is a 0-based Stokes axis index.
+_POL_FIX_VERSION = Version("2.8.0")
+_fitscube_has_pol_fix = Version(
+    fitscube.__version__.split("+")[0].split(".dev")[0]
+) >= (_POL_FIX_VERSION)
+
+
+def _make_stokes_images(d: Path, freqs, beams, stokes_code: float) -> list[Path]:
+    """wsclean-order (RA, DEC, FREQ, STOKES) single-plane images."""
+    d.mkdir(parents=True, exist_ok=True)
+    files = []
+    for i, (freq, beam) in enumerate(zip(freqs, beams, strict=True)):
+        p = d / f"img_{i}.fits"
+        _write_image(p, fill=float(i + 1), beam=beam)
+        with fits.open(p) as hdul:
+            header = hdul[0].header
+            data = hdul[0].data[np.newaxis, np.newaxis]
+        header["CTYPE3"], header["CRVAL3"] = "FREQ", freq
+        header["CDELT3"], header["CRPIX3"], header["CUNIT3"] = 1.0e6, 1.0, "Hz"
+        header["CTYPE4"], header["CRVAL4"] = "STOKES", stokes_code
+        header["CDELT4"], header["CRPIX4"] = 1.0, 1.0
+        fits.writeto(p, data, header, overwrite=True)
+        files.append(p)
+    return files
+
+
+@pytest.mark.parametrize("stokes_code", [1.0, 3.0, -5.0])  # I, U, XX
+def test_single_stokes_beam_table_pol(tmp_path, stokes_code):
+    """BEAMS CHAN/POL are 0-based axis indices, not FITS Stokes codes."""
+    freqs = [1.0e9, 2.0e9, 3.0e9]
+    beams = [10.0 / 3600.0, 11.0 / 3600.0, 12.0 / 3600.0]
+    rs_files = _make_stokes_images(tmp_path / "rs", freqs, beams, stokes_code)
+    rs_cube = tmp_path / "rs_cube.fits"
+    fitscube_rs.combine_fits([str(f) for f in rs_files], str(rs_cube), overwrite=True)
+
+    # Correctness (always)
+    with fits.open(rs_cube) as hdul:
+        assert hdul[0].header["CRVAL4"] == stokes_code
+        assert hdul["BEAMS"].header["NPOL"] == 1
+        assert hdul["BEAMS"].data["POL"].tolist() == [0, 0, 0]
+        assert hdul["BEAMS"].data["CHAN"].tolist() == [0, 1, 2]
+
+    # Parity (only when the reference carries the POL fix)
+    if not _fitscube_has_pol_fix:
+        pytest.skip(
+            f"fitscube {fitscube.__version__} predates the BEAMS POL fix "
+            f"(>= {_POL_FIX_VERSION}); skipping cross-check"
+        )
+    ref_files = _make_stokes_images(tmp_path / "ref", freqs, beams, stokes_code)
+    ref_cube = tmp_path / "ref_cube.fits"
+    fitscube.combine_fits(file_list=ref_files, out_cube=ref_cube, overwrite=True)
+    with fits.open(ref_cube) as ref_hdul, fits.open(rs_cube) as rs_hdul:
+        np.testing.assert_allclose(
+            np.nan_to_num(rs_hdul[0].data), np.nan_to_num(ref_hdul[0].data)
+        )
+        for key in ("NCHAN", "NPOL"):
+            assert rs_hdul["BEAMS"].header[key] == ref_hdul["BEAMS"].header[key]
+        for col in ("CHAN", "POL"):
+            assert (
+                rs_hdul["BEAMS"].data[col].tolist()
+                == ref_hdul["BEAMS"].data[col].tolist()
+            )
+
+
 def test_time_domain_combine(tmp_path):
     # Evenly spaced 10s steps; combine along the TIME axis (DATE-OBS).
     dates = [
