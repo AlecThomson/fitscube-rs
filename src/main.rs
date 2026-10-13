@@ -128,11 +128,17 @@ fn init_logging(verbosity: u8) {
 fn run_combine(args: CombineArgs) -> Result<()> {
     init_logging(args.verbosity);
 
-    if !args.overwrite && args.out_cube.exists() {
-        anyhow::bail!(
-            "Output file {} already exists. Use --overwrite to overwrite.",
-            args.out_cube.display()
-        );
+    let unit = if args.time_domain { "s" } else { "Hz" };
+    let specs_file = args.out_cube.with_extension(format!("specs_{unit}.txt"));
+    if !args.overwrite {
+        for path in [&args.out_cube, &specs_file] {
+            if path.exists() {
+                anyhow::bail!(
+                    "Output file {} already exists. Use --overwrite to overwrite.",
+                    path.display()
+                );
+            }
+        }
     }
 
     let options = CombineOptions {
@@ -158,8 +164,6 @@ fn run_combine(args: CombineArgs) -> Result<()> {
     info!("Written cube to {}", args.out_cube.display());
 
     // Write the axis values alongside the cube, as the original CLI does.
-    let unit = if args.time_domain { "s" } else { "Hz" };
-    let specs_file = args.out_cube.with_extension(format!("specs_{unit}.txt"));
     let body: String = specs.iter().map(|v| format!("{v}\n")).collect::<String>();
     std::fs::write(&specs_file, body)
         .with_context(|| format!("writing spec values to {}", specs_file.display()))?;

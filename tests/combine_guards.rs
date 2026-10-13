@@ -1029,3 +1029,32 @@ fn single_worker() {
         assert!(all_eq(plane, chan as f64));
     }
 }
+
+/// The CLI leaves an existing axis-values file alone without --overwrite.
+#[test]
+fn cli_keeps_specs_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    let specs_file = dir.path().join("cube.specs_Hz.txt");
+    std::fs::write(&specs_file, "keep\n").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_fitscubers"))
+        .arg("combine")
+        .args(&files)
+        .arg(&out_cube)
+        .output()
+        .unwrap()
+        .status;
+    assert!(!status.success());
+    assert!(!out_cube.exists());
+    assert_eq!(std::fs::read_to_string(&specs_file).unwrap(), "keep\n");
+
+    fitscubers(&files, &out_cube, &["--overwrite"]);
+    assert_eq!(
+        std::fs::read_to_string(&specs_file)
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+}
