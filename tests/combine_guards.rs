@@ -9,7 +9,8 @@ use fitscube_rs::bounding_box::{BoundingBox, get_common_bounding_box};
 use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::fits_io::update_key_f64;
+use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_str};
+use fitscube_rs::specs::read_spec_from_header;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 
@@ -869,5 +870,63 @@ fn scaled_integer_input_is_copied_losslessly() {
     for (chan, plane) in read_planes(&out_cube).iter().enumerate() {
         let physical = 32768.0 + 2.0 * (chan as f64 * 1000.0 - 30000.0);
         assert!(all_eq(plane, physical), "channel {chan}: {:?}", &plane[..2]);
+    }
+}
+
+fn edit(path: &Path, f: impl FnOnce(&mut FitsFile)) {
+    let mut fptr = FitsFile::edit(path.to_string_lossy().as_ref()).unwrap();
+    f(&mut fptr);
+}
+
+/// The frequency of the first pixel follows the FITS WCS rules for CRPIX, CD
+/// and CUNIT.
+#[test]
+fn header_frequency_follows_wcs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = make_plane(&dir.path().join("p.fits"), 1e9, Plane::default());
+    let freq = || read_spec_from_header(&path, false);
+    assert_eq!(freq().unwrap(), 1e9);
+
+    set_key(&path, "CRPIX4", 2.0);
+    assert_eq!(freq().unwrap(), 1e9 - 1e6);
+
+    // CRPIX defaults to 0
+    edit(&path, |f| delete_key(f, "CRPIX4").unwrap());
+    assert_eq!(freq().unwrap(), 1e9 + 1e6);
+
+    // CDi_i replaces CDELTi
+    edit(&path, |f| {
+        delete_key(f, "CDELT4").unwrap();
+        update_key_f64(f, "CRPIX4", 3.0).unwrap();
+        update_key_f64(f, "CD4_4", 5e5).unwrap();
+    });
+    assert_eq!(freq().unwrap(), 1e9 - 2.0 * 5e5);
+
+    edit(&path, |f| {
+        update_key_f64(f, "CRVAL4", 1000.0).unwrap();
+        update_key_f64(f, "CRPIX4", 1.0).unwrap();
+        update_key_str(f, "CUNIT4", "MHz").unwrap();
+    });
+    assert_eq!(freq().unwrap(), 1e9);
+
+    edit(&path, |f| update_key_str(f, "CUNIT4", "m/s").unwrap());
+    let err = freq().unwrap_err();
+    assert!(matches!(err, FitsCubeError::InvalidSpec(_)), "{err:?}");
+}
+
+/// A NaN frequency is refused instead of panicking in a sort.
+#[test]
+fn nan_spec_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    for create_blanks in [false, true] {
+        let opts = CombineOptions {
+            spec_list: Some(vec![1e9, f64::NAN, 3e9, 4e9]),
+            create_blanks,
+            ..options()
+        };
+        let err = combine_fits(&files, &out_cube, &opts).unwrap_err();
+        assert!(matches!(err, FitsCubeError::InvalidSpec(_)), "{err:?}");
     }
 }

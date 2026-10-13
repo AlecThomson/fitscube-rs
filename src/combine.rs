@@ -139,7 +139,7 @@ fn float_length_to_bitpix(float_length: Option<u8>) -> Result<Option<i64>> {
 
 fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v.sort_by(f64::total_cmp);
     let n = v.len();
     if n == 0 {
         return f64::NAN;
@@ -164,7 +164,7 @@ fn std_dev(values: &[f64]) -> f64 {
 /// `argsort`: indices that would sort `keys` ascending (stable).
 fn argsort(keys: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..keys.len()).collect();
-    idx.sort_by(|&a, &b| keys[a].partial_cmp(&keys[b]).unwrap());
+    idx.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
     idx
 }
 
@@ -175,7 +175,7 @@ fn is_evenly_spaced(specs: &[f64], time_domain_mode: bool) -> bool {
         return true;
     }
     let mut sorted = specs.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(f64::total_cmp);
     let diff: Vec<f64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
 
     if time_domain_mode {
