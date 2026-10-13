@@ -994,3 +994,21 @@ fn integer_blank_is_kept() {
     let err = combine_fits(&files, &out_cube, &options()).unwrap_err();
     assert!(matches!(err, FitsCubeError::ScalingMismatch(_)), "{err:?}");
 }
+
+/// A bad --floating is a usage error, not a panic.
+#[test]
+fn cli_rejects_bad_floating() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_fitscubers"))
+        .arg("combine")
+        .args(&files)
+        .arg(dir.path().join("cube.fits"))
+        .args(["--floating", "16"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("use 32 or 64"), "{stderr}");
+    fitscubers(&files, &dir.path().join("cube.fits"), &["--floating", "64"]);
+}

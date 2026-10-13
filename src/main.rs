@@ -70,8 +70,8 @@ struct CombineArgs {
     #[arg(long)]
     invalidate_zeros: bool,
     /// Output float precision in bits (32 or 64). Defaults to the input.
-    #[arg(long, value_parser = ["32", "64"])]
-    floating: Option<String>,
+    #[arg(long, value_parser = parse_floating)]
+    floating: Option<u8>,
     /// Keep images whose restoring beam is exactly zero. By default such images
     /// are blanked with NaNs, as a zero beam means no PSF was fitted for that
     /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
@@ -101,6 +101,14 @@ struct ExtractArgs {
     /// Output path. Generated from the cube name if omitted.
     #[arg(long)]
     output_path: Option<PathBuf>,
+}
+
+fn parse_floating(s: &str) -> std::result::Result<u8, String> {
+    match s {
+        "32" => Ok(32),
+        "64" => Ok(64),
+        _ => Err(format!("{s} is not a FITS float width; use 32 or 64")),
+    }
 }
 
 fn init_logging(verbosity: u8) {
@@ -138,7 +146,7 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         bounding_box: args.bounding_box,
         supplied_bounding_box: None,
         invalidate_zeros: args.invalidate_zeros,
-        float_length: args.floating.as_deref().map(|s| s.parse().unwrap()),
+        float_length: args.floating,
         blank_zero_beams: !args.no_blank_zero_beams,
         // CLI: show progress bars on stderr.
         progress: true,

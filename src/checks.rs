@@ -60,11 +60,10 @@ pub fn read_input_axes(path: &Path) -> Result<InputAxes> {
     );
     let ctypes: Vec<String> = (1..=naxis)
         .map(|n| {
-            hdu.read_key::<String>(&mut fptr, &format!("CTYPE{n}"))
-                .map(|c| c.trim().to_string())
-                .unwrap_or_default()
+            let ctype: Option<String> = read_opt_key(&hdu, &mut fptr, &format!("CTYPE{n}"))?;
+            Ok(ctype.map(|c| c.trim().to_string()).unwrap_or_default())
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let stokes_codes = match ctypes.iter().position(|c| c == "STOKES") {
         None => None,
@@ -72,13 +71,13 @@ pub fn read_input_axes(path: &Path) -> Result<InputAxes> {
             let n = i + 1;
             let len: i64 = hdu.read_key(&mut fptr, &format!("NAXIS{n}"))?;
             // FITS defaults for an absent card
-            let key = |fptr: &mut FitsFile, key: &str, default: f64| {
-                hdu.read_key::<f64>(fptr, &format!("{key}{n}"))
-                    .unwrap_or(default)
+            let mut key = |key: &str, default: f64| {
+                read_opt_key::<f64>(&hdu, &mut fptr, &format!("{key}{n}"))
+                    .map(|v| v.unwrap_or(default))
             };
-            let crval = key(&mut fptr, "CRVAL", 0.0);
-            let cdelt = key(&mut fptr, "CDELT", 1.0);
-            let crpix = key(&mut fptr, "CRPIX", 0.0);
+            let crval = key("CRVAL", 0.0)?;
+            let cdelt = key("CDELT", 1.0)?;
+            let crpix = key("CRPIX", 0.0)?;
             Some(
                 (1..=len)
                     .map(|pix| (crval + cdelt * (pix as f64 - crpix)).round() as i64)

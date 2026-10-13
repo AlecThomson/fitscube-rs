@@ -695,7 +695,7 @@ pub fn combine_fits(
     let has_beams = beams::check_for_any_beam(&sorted_files)?;
     let mut zero_beam = vec![false; specs.len()];
     let (beams_vec, single_beam): (Option<Vec<Beam>>, bool) = if has_beams {
-        let mut beams = beams::expand_beams(&beams::parse_beams(&sorted_files)?, &missing);
+        let mut beams = beams::expand_beams(&beams::parse_beams(&sorted_files)?, &missing)?;
         let found_zero_beams = beams::find_zero_beams(&beams);
         if found_zero_beams.iter().any(|&z| z) {
             // Keep the message readable when a whole run has zero beams
@@ -848,7 +848,9 @@ pub fn combine_fits(
         })?,
         8 | 16 | 32 | 64 => write(&|chan| {
             // Integer cubes never have blank channels (checked above)
-            let path = inputs[chan].expect("integer cubes have no blank channels");
+            let path = inputs[chan].ok_or_else(|| {
+                FitsCubeError::ChannelMissing(format!("no input for channel {chan}"))
+            })?;
             Ok(encode_int_be(
                 &process_plane_raw_int(path, bbox)?,
                 init.bitpix,
