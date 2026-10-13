@@ -9,6 +9,7 @@ __all__ = [
     "BoundingBox",
     "combine_fits",
     "extract_plane_from_cube",
+    "extract_planes_from_cube",
     "get_common_bounding_box",
 ]
 
@@ -133,6 +134,32 @@ def extract_plane_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Path
         ChannelMissingException: If the index is outside the cube.
         OSError: On a FITS read or write error.
         ValueError: On invalid options.
+    """
+
+def extract_planes_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Path, hdu_index: builtins.int = 0, overwrite: builtins.bool = False, output_paths: typing.Optional[typing.Sequence[builtins.str | os.PathLike | pathlib.Path]] = None, max_workers: typing.Optional[builtins.int] = 4) -> builtins.list[builtins.str]:
+    r"""
+    Extract every channel of a FITS cube into its own image.
+    
+    The cube and its beam table are read once.
+    
+    Args:
+        fits_cube (str): The cube to extract from.
+        hdu_index (int): HDU index of the cube data (default 0).
+        overwrite (bool): Overwrite output files that exist.
+        output_paths (list[str], optional): One output path per channel.
+            Defaults to ``cube.channel-N.fits`` beside the cube.
+        max_workers (int, optional): Planes written at once (default 4).
+            ``None`` uses every core.
+    
+    Returns:
+        list[str]: The path of each channel's image, in channel order.
+    
+    Raises:
+        FileExistsError: If an output exists and ``overwrite`` is not set.
+        FileNotFoundError: If the cube does not exist.
+        TargetAxisMissingException: If the cube has no FREQ axis.
+        ShapeMismatchException: If ``output_paths`` does not match the channels.
+        OSError: On a FITS read or write error.
     """
 
 def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], invalidate_zeros: builtins.bool = False) -> BoundingBox:

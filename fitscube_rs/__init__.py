@@ -12,6 +12,7 @@ from fitscube_rs._fitscube_rs import (
     BoundingBox,
     combine_fits,
     extract_plane_from_cube,
+    extract_planes_from_cube,
     get_common_bounding_box,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     "TargetAxisMissingException",
     "combine_fits",
     "extract_plane_from_cube",
+    "extract_planes_from_cube",
     "get_common_bounding_box",
 ]
 
