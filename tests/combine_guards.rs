@@ -1012,3 +1012,20 @@ fn cli_rejects_bad_floating() {
     assert!(stderr.contains("use 32 or 64"), "{stderr}");
     fitscubers(&files, &dir.path().join("cube.fits"), &["--floating", "64"]);
 }
+
+/// One worker reads every plane without stalling the writer.
+#[test]
+fn single_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    let opts = CombineOptions {
+        max_workers: Some(1),
+        bounding_box: true,
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    for (chan, plane) in read_planes(&out_cube).iter().enumerate() {
+        assert!(all_eq(plane, chan as f64));
+    }
+}

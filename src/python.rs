@@ -164,7 +164,8 @@ fn get_common_bounding_box(
 ///     ignore_spec (bool): Ignore frequency/time info and just stack.
 ///     create_blanks (bool): Interpolate an evenly-spaced axis, blanking gaps.
 ///     overwrite (bool): Overwrite the output cube if it exists.
-///     max_workers (int, optional): Concurrency bound for in-flight planes.
+///     max_workers (int, optional): Number of threads reading input images.
+///         Defaults to one per core.
 ///     time_domain_mode (bool): Combine along time (DATE-OBS) instead of FREQ.
 ///     bounding_box (bool | BoundingBox): Trim blank padding via a common
 ///         bounding box. A ``BoundingBox`` is used as is (see

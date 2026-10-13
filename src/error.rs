@@ -19,6 +19,10 @@ pub enum FitsCubeError {
     #[error("FITS I/O error: {0}")]
     Fits(#[from] fitsio::errors::Error),
 
+    /// The worker thread pool could not be started.
+    #[error("thread pool: {0}")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
+
     /// Filesystem I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),

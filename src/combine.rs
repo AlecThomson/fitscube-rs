@@ -16,6 +16,7 @@ use fitsio::errors::check_status;
 use fitsio::hdu::HduInfo;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, get_common_bounding_box};
@@ -84,6 +85,7 @@ pub struct CombineOptions {
     pub ignore_spec: bool,
     pub create_blanks: bool,
     pub overwrite: bool,
+    /// Threads used to read input images. `None` uses every core.
     pub max_workers: Option<usize>,
     pub time_domain_mode: bool,
     pub bounding_box: bool,
@@ -568,7 +570,7 @@ fn write_cube_raw(
     n_chan: usize,
     plane_bytes: u64,
     encode_channel: impl Fn(usize) -> Result<Vec<u8>> + Sync,
-    max_workers: Option<usize>,
+    pool: Option<&ThreadPool>,
     progress: bool,
 ) -> Result<()> {
     // Lay down the header and size the file. `set_len` past the header leaves the
@@ -586,18 +588,15 @@ fn write_cube_raw(
 
     // Buffer enough decoded planes that the parallel readers stay ahead of the
     // single (serial) writer instead of blocking on a tiny queue.
-    let default_bound = std::thread::available_parallelism()
-        .map(|n| n.get() * 2)
-        .unwrap_or(8);
-    let bound = max_workers.unwrap_or(default_bound).max(1);
+    let threads = pool.map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads);
+    let bound = threads * 2;
     let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(bound);
 
     std::thread::scope(|scope| -> Result<()> {
         let encode_channel = &encode_channel;
         let producer = scope.spawn(move || -> Result<()> {
-            let res = (0..n_chan)
-                .into_par_iter()
-                .try_for_each(|new_chan| -> Result<()> {
+            let res = in_pool(pool, || {
+                (0..n_chan).into_par_iter().try_for_each(|new_chan| -> Result<()> {
                     let bytes = encode_channel(new_chan)?;
                     if bytes.len() as u64 != plane_bytes {
                         return Err(FitsCubeError::Other(format!(
@@ -608,7 +607,8 @@ fn write_cube_raw(
                     tx.send((new_chan, bytes))
                         .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
                     Ok(())
-                });
+                })
+            });
             drop(tx); // close the channel so the writer loop below ends
             res
         });
@@ -649,6 +649,14 @@ fn encode_float_channel<T: FloatPixel>(
     })
 }
 
+/// Run `f` in `pool`, or in rayon's global pool when there is none.
+fn in_pool<R: Send>(pool: Option<&ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
 /// Combine `file_list` into the cube at `out_cube`. Returns the output-axis
 /// values (Hz for frequency mode, MJD seconds for time mode).
 pub fn combine_fits(
@@ -663,7 +671,13 @@ pub fn combine_fits(
 
     // The cube's header comes from the first input, so every input must share
     // its pixel grid, axes and Stokes parameter.
-    let input_axes = read_inputs_axes(file_list)?;
+    let pool = options
+        .max_workers
+        .map(|n| ThreadPoolBuilder::new().num_threads(n.max(1)).build())
+        .transpose()?;
+    let pool = pool.as_ref();
+
+    let input_axes = in_pool(pool, || read_inputs_axes(file_list))?;
     check_matching_shapes(file_list, &input_axes)?;
     check_matching_axes(file_list, &input_axes)?;
     let storage = input_axes[0].storage;
@@ -751,7 +765,9 @@ pub fn combine_fits(
         let spin = options
             .progress
             .then(|| spinner("solving for common bounding box"));
-        let bb = get_common_bounding_box(&sorted_files, options.invalidate_zeros)?;
+        let bb = in_pool(pool, || {
+            get_common_bounding_box(&sorted_files, options.invalidate_zeros)
+        })?;
         if let Some(spin) = spin {
             spin.finish_and_clear();
         }
@@ -833,7 +849,7 @@ pub fn combine_fits(
             inputs.len(),
             plane_bytes,
             encode,
-            options.max_workers,
+            pool,
             options.progress,
         )
     };
@@ -873,4 +889,19 @@ pub fn combine_fits(
     }
 
     Ok(specs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_pool_limits_threads() {
+        let pool = ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        assert_eq!(in_pool(Some(&pool), rayon::current_num_threads), 2);
+        assert_eq!(
+            in_pool(None, rayon::current_num_threads),
+            rayon::current_num_threads()
+        );
+    }
 }

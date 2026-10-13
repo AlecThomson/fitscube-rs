@@ -60,7 +60,7 @@ struct CombineArgs {
     /// Increase output verbosity (repeatable).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbosity: u8,
-    /// Maximum number of in-flight planes (concurrency bound).
+    /// Number of threads reading input images (default: one per core).
     #[arg(long)]
     max_workers: Option<usize>,
     /// Trim blank padding around the data using a common bounding box.
