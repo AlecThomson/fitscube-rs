@@ -21,9 +21,11 @@ pub mod checks;
 pub mod combine;
 pub mod error;
 pub mod extract;
-mod keys;
+mod partial;
+mod pixels;
 pub mod progress;
 pub mod specs;
+mod wcs;
 
 pub use beams::Beam;
 pub use bounding_box::{
@@ -31,7 +33,9 @@ pub use bounding_box::{
 };
 pub use combine::{CombineOptions, combine_fits};
 pub use error::{FitsCubeError, Result};
-pub use extract::{ExtractOptions, extract_plane_from_cube};
+pub use extract::{
+    ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube, extract_planes_from_cube,
+};
 
 #[cfg(feature = "python")]
 mod python;

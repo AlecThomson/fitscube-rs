@@ -1,17 +1,15 @@
-//! Per-channel restoring-beam handling.
-//!
-//! Port of the beam logic in `fitscube.combine_fits`: read BMAJ/BMIN/BPA (all in
-//! degrees) from each input header, decide whether they are all the same, and —
-//! when they vary — emit a CASA-style `BEAMS` binary-table extension.
-use std::path::{Path, PathBuf};
-
+//! Restoring beams, and the CASA `BEAMS` table that holds them when they vary
+//! across the cube.
 use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 
+use crate::checks::InputHeader;
 use crate::error::{FitsCubeError, Result};
-use atfits_rs::{has_key, read_key_f64};
 
-/// A restoring beam in degrees. Any field may be NaN (no beam in header).
+/// cfitsio `BAD_HDU_NUM`, returned when no HDU has the requested name.
+const BAD_HDU_NUM: i32 = 301;
+
+/// A restoring beam in degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Beam {
     pub major_deg: f64,
@@ -20,48 +18,30 @@ pub struct Beam {
 }
 
 impl Beam {
+    /// No beam: a blank channel, or an input without BMAJ.
+    pub const NAN: Beam = Beam {
+        major_deg: f64::NAN,
+        minor_deg: f64::NAN,
+        pa_deg: f64::NAN,
+    };
+
     pub fn is_nan(&self) -> bool {
         self.major_deg.is_nan() || self.minor_deg.is_nan() || self.pa_deg.is_nan()
     }
 }
 
-/// Read BMAJ/BMIN/BPA (degrees) from a header. Missing → a NaN beam, matching
-/// the `NoBeamException` fallback in the original.
-pub fn read_beam(path: &Path) -> Result<Beam> {
-    let major_deg = read_key_f64(path, "BMAJ")?.unwrap_or(f64::NAN);
-    let minor_deg = read_key_f64(path, "BMIN")?.unwrap_or(f64::NAN);
-    let pa_deg = read_key_f64(path, "BPA")?.unwrap_or(f64::NAN);
-    Ok(Beam {
-        major_deg,
-        minor_deg,
-        pa_deg,
+/// One beam per input, NaN for inputs without one, or `None` if no input has
+/// a beam.
+pub fn input_beams(headers: &[InputHeader]) -> Option<Vec<Beam>> {
+    headers.iter().any(|h| h.beam.is_some()).then(|| {
+        headers
+            .iter()
+            .map(|h| h.beam.unwrap_or(Beam::NAN))
+            .collect()
     })
 }
 
-/// Whether any input has a beam (BMAJ) in its header. Mirrors
-/// `check_for_any_beam`: stops at the first file that has one.
-pub fn check_for_any_beam(file_list: &[PathBuf]) -> Result<bool> {
-    for path in file_list {
-        if has_key(path, "BMAJ")? {
-            tracing::info!("Found beam properties in {}", path.display());
-            return Ok(true);
-        }
-    }
-    // No beams were found among any of the inputs, so no beam information can
-    // be recorded in the output
-    Ok(false)
-}
-
-/// Read one beam per file.
-pub fn parse_beams(file_list: &[PathBuf]) -> Result<Vec<Beam>> {
-    file_list.iter().map(|p| read_beam(p)).collect()
-}
-
-/// Place per-file beams onto the output channel grid, NaN for blank channels.
-/// Mirrors `expand_beams`.
-///
-/// `beams` holds one beam per input file, in output channel order; `missing`
-/// flags the blank channels of the output cube.
+/// Spread one beam per input over the cube channels, NaN for `missing` ones.
 pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Result<Vec<Beam>> {
     let populated = missing.iter().filter(|&&m| !m).count();
     if populated != beams.len() {
@@ -71,31 +51,20 @@ pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Result<Vec<Beam>> {
             missing.len()
         )));
     }
-    let nan = Beam {
-        major_deg: f64::NAN,
-        minor_deg: f64::NAN,
-        pa_deg: f64::NAN,
-    };
     let mut present = beams.iter();
     Ok(missing
         .iter()
-        .map(|&m| {
-            if m {
-                nan
-            } else {
-                *present.next().unwrap_or(&nan)
-            }
+        .map(|&m| match m {
+            true => Beam::NAN,
+            false => *present.next().unwrap_or(&Beam::NAN),
         })
         .collect())
 }
 
-/// Channels whose restoring beam is exactly zero. Mirrors `find_zero_beams`.
+/// Channels whose beam has a zero major or minor axis.
 ///
-/// A zero-sized beam is not a real PSF. wsclean writes one when a plane carries
-/// no fitted beam at all — most notably the model image that
-/// `-fit-spectral-pol` plants into an otherwise empty channel. NaN beams (blank
-/// channels, missing BMAJ) are handled elsewhere, and `NaN == 0.0` is false, so
-/// they never appear here. A zero position angle is legitimate.
+/// wsclean writes such a beam for a plane without a fitted PSF, such as a
+/// `-fit-spectral-pol` model image. A zero position angle is fine.
 pub fn find_zero_beams(beams: &[Beam]) -> Vec<bool> {
     beams
         .iter()
@@ -103,27 +72,16 @@ pub fn find_zero_beams(beams: &[Beam]) -> Vec<bool> {
         .collect()
 }
 
-/// Replace the flagged beams with NaN beams. Mirrors `nan_zero_beams`.
+/// `beams` with the flagged ones replaced by [`Beam::NAN`].
 pub fn nan_zero_beams(beams: &[Beam], zero_beam: &[bool]) -> Vec<Beam> {
     beams
         .iter()
         .zip(zero_beam)
-        .map(|(&b, &zero)| {
-            if zero {
-                Beam {
-                    major_deg: f64::NAN,
-                    minor_deg: f64::NAN,
-                    pa_deg: f64::NAN,
-                }
-            } else {
-                b
-            }
-        })
+        .map(|(&b, &zero)| if zero { Beam::NAN } else { b })
         .collect()
 }
 
-/// `numpy.isclose` with the default tolerances (`rtol = 1e-5`, `atol = 1e-8`).
-/// NaNs are never close (matching numpy with `equal_nan=False`).
+/// `numpy.isclose` with its default tolerances. NaN is never close.
 fn isclose(a: f64, b: f64) -> bool {
     if a.is_nan() || b.is_nan() {
         return false;
@@ -131,15 +89,11 @@ fn isclose(a: f64, b: f64) -> bool {
     (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
 }
 
-/// Whether every beam matches the first on major, minor and PA.
-///
-/// Mirrors the `single_beam` test in the original (compares shape, not area).
-/// If beams are all-NaN this returns `false`, since NaN is never close to NaN.
+/// Whether every beam matches the first. False when the beams are NaN.
 pub fn is_single_beam(beams: &[Beam]) -> bool {
-    if beams.is_empty() {
+    let Some(first) = beams.first() else {
         return false;
-    }
-    let first = beams[0];
+    };
     beams.iter().all(|b| {
         isclose(first.major_deg, b.major_deg)
             && isclose(first.minor_deg, b.minor_deg)
@@ -147,22 +101,14 @@ pub fn is_single_beam(beams: &[Beam]) -> bool {
     })
 }
 
-/// The 0-based plane indices along the Stokes axis. Mirrors `get_polarisation`.
-///
-/// These are the values the CASA beam table expects in its POL column: indices
-/// into the cube's Stokes axis, not FITS Stokes codes. `stokes_len` is the
-/// length of that axis, or `None` if there is no Stokes axis, which CASA counts
-/// as one Stokes plane in its beam set.
+/// 0-based plane indices along the Stokes axis, the POL values of the beam
+/// table. No Stokes axis counts as one plane.
 pub fn get_polarisation(stokes_len: Option<usize>) -> Vec<i32> {
     (0..stokes_len.unwrap_or(1) as i32).collect()
 }
 
-/// Check that a beam table can be written for a cube with these Stokes planes,
-/// returning the POL value of every row.
-///
-/// Only the single-Stokes case (POL = 0) is supported, as in `make_beam_table`.
-/// Call this before writing any data, so an unsupported cube fails before the
-/// planes are copied in.
+/// The POL value of every beam table row. Only single-Stokes cubes are
+/// supported.
 pub fn beam_table_pol(stokes_idx: &[i32]) -> Result<i32> {
     match stokes_idx {
         [pol] => Ok(*pol),
@@ -173,70 +119,74 @@ pub fn beam_table_pol(stokes_idx: &[i32]) -> Result<i32> {
     }
 }
 
-/// Append a CASA `BEAMS` binary-table extension to an open output cube.
+/// Append a CASA `BEAMS` table (BMAJ, BMIN in arcsec, BPA in deg, CHAN, POL) to
+/// an open cube.
 ///
-/// Columns: BMAJ/BMIN [arcsec], BPA [deg], CHAN, POL. CHAN and POL are 0-based
-/// indices into the cube's frequency and Stokes axes (CASA convention), not
-/// FITS Stokes codes; `stokes_idx` comes from [`get_polarisation`]. NaN beam values are
-/// replaced with `f32::MIN_POSITIVE` (numpy `finfo(float32).tiny`) to keep CASA
-/// happy, exactly as `make_beam_table` does.
+/// CASA cannot read NaN beams, so NaN and zero-sized beams are written as
+/// `f32::MIN_POSITIVE` (numpy's `finfo(float32).tiny`).
 pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32]) -> Result<()> {
     let pol = beam_table_pol(stokes_idx)?;
-    let tiny = f32::MIN_POSITIVE;
     let nchan = beams.len();
-    // A zero-sized beam is not a valid PSF, and a literal zero is exactly what
-    // the sentinel below exists to keep out of the table. NaN them first so they
-    // pick up the sentinel too. This is done per-beam rather than per-column: a
-    // zero BPA on an otherwise real beam is perfectly legitimate.
     let beams = nan_zero_beams(beams, &find_zero_beams(beams));
-
-    let nan_to_tiny = |v: f32| if v.is_nan() { tiny } else { v };
-
-    let bmaj: Vec<f32> = beams
-        .iter()
-        .map(|b| nan_to_tiny((b.major_deg * 3600.0) as f32))
-        .collect();
-    let bmin: Vec<f32> = beams
-        .iter()
-        .map(|b| nan_to_tiny((b.minor_deg * 3600.0) as f32))
-        .collect();
-    let bpa: Vec<f32> = beams.iter().map(|b| nan_to_tiny(b.pa_deg as f32)).collect();
+    let column = |value: fn(&Beam) -> f64| -> Vec<f32> {
+        beams
+            .iter()
+            .map(|b| match value(b) as f32 {
+                v if v.is_nan() => f32::MIN_POSITIVE,
+                v => v,
+            })
+            .collect()
+    };
+    let bmaj = column(|b| b.major_deg * 3600.0);
+    let bmin = column(|b| b.minor_deg * 3600.0);
+    let bpa = column(|b| b.pa_deg);
     let chan: Vec<i32> = (0..nchan as i32).collect();
     let pols: Vec<i32> = vec![pol; nchan];
 
-    let col_bmaj = ColumnDescription::new("BMAJ")
-        .with_type(ColumnDataType::Float)
-        .create()?;
-    let col_bmin = ColumnDescription::new("BMIN")
-        .with_type(ColumnDataType::Float)
-        .create()?;
-    let col_bpa = ColumnDescription::new("BPA")
-        .with_type(ColumnDataType::Float)
-        .create()?;
-    let col_chan = ColumnDescription::new("CHAN")
-        .with_type(ColumnDataType::Int)
-        .create()?;
-    let col_pol = ColumnDescription::new("POL")
-        .with_type(ColumnDataType::Int)
-        .create()?;
-
-    let table_hdu =
-        fptr.create_table("BEAMS", &[col_bmaj, col_bmin, col_bpa, col_chan, col_pol])?;
-    table_hdu.write_col(fptr, "BMAJ", &bmaj)?;
-    table_hdu.write_col(fptr, "BMIN", &bmin)?;
-    table_hdu.write_col(fptr, "BPA", &bpa)?;
-    table_hdu.write_col(fptr, "CHAN", &chan)?;
-    table_hdu.write_col(fptr, "POL", &pols)?;
-
-    let beam_hdu = fptr.hdu("BEAMS")?;
-    beam_hdu.write_key(fptr, "NCHAN", nchan as i64)?;
-    beam_hdu.write_key(fptr, "NPOL", stokes_idx.len() as i64)?;
+    let col = |name: &str, typ| ColumnDescription::new(name).with_type(typ).create();
+    let columns = [
+        col("BMAJ", ColumnDataType::Float)?,
+        col("BMIN", ColumnDataType::Float)?,
+        col("BPA", ColumnDataType::Float)?,
+        col("CHAN", ColumnDataType::Int)?,
+        col("POL", ColumnDataType::Int)?,
+    ];
+    let hdu = fptr.create_table("BEAMS", &columns)?;
+    hdu.write_col(fptr, "BMAJ", &bmaj)?;
+    hdu.write_col(fptr, "BMIN", &bmin)?;
+    hdu.write_col(fptr, "BPA", &bpa)?;
+    hdu.write_col(fptr, "CHAN", &chan)?;
+    hdu.write_col(fptr, "POL", &pols)?;
+    hdu.write_key(fptr, "NCHAN", nchan as i64)?;
+    hdu.write_key(fptr, "NPOL", stokes_idx.len() as i64)?;
     // casacore reads the beam units from TUNITn
     for (col, unit) in [(1, "arcsec"), (2, "arcsec"), (3, "deg")] {
-        beam_hdu.write_key(fptr, &format!("TUNIT{col}"), unit)?;
+        hdu.write_key(fptr, &format!("TUNIT{col}"), unit)?;
     }
-
     Ok(())
+}
+
+/// The beams in the `BEAMS` table of an open file, or `None` if it has none.
+pub fn read_beam_table(fptr: &mut FitsFile) -> Result<Option<Vec<Beam>>> {
+    let hdu = match fptr.hdu("BEAMS") {
+        Ok(hdu) => hdu,
+        Err(fitsio::errors::Error::Fits(e)) if e.status == BAD_HDU_NUM => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let bmaj: Vec<f32> = hdu.read_col(fptr, "BMAJ")?;
+    let bmin: Vec<f32> = hdu.read_col(fptr, "BMIN")?;
+    let bpa: Vec<f32> = hdu.read_col(fptr, "BPA")?;
+    let beams = bmaj
+        .iter()
+        .zip(&bmin)
+        .zip(&bpa)
+        .map(|((&maj, &min), &pa)| Beam {
+            major_deg: maj as f64 / 3600.0,
+            minor_deg: min as f64 / 3600.0,
+            pa_deg: pa as f64,
+        })
+        .collect();
+    Ok(Some(beams))
 }
 
 #[cfg(test)]
@@ -265,7 +215,6 @@ mod tests {
 
     #[test]
     fn polarisation_is_axis_index() {
-        // POL values are 0-based indices along the Stokes axis, not Stokes codes
         assert_eq!(get_polarisation(None), vec![0]);
         assert_eq!(get_polarisation(Some(1)), vec![0]);
         assert_eq!(get_polarisation(Some(3)), vec![0, 1, 2]);
@@ -300,10 +249,8 @@ mod tests {
             b(1.0, 1.0, 0.0),
             b(0.0, 0.0, 0.0),
             b(2.0, 0.0, 0.0),
-            b(f64::NAN, f64::NAN, f64::NAN),
+            Beam::NAN,
         ];
-        // A zero major or a zero minor is degenerate; a NaN beam is not a zero
-        // beam, and a zero position angle is perfectly legitimate.
         assert_eq!(find_zero_beams(&beams), vec![false, true, true, false]);
     }
 
@@ -319,7 +266,7 @@ mod tests {
 
     #[test]
     fn all_nan_is_not_single() {
-        let beams = vec![b(f64::NAN, f64::NAN, f64::NAN); 3];
+        let beams = vec![Beam::NAN; 3];
         assert!(!is_single_beam(&beams));
     }
 }

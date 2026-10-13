@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use atfits_rs::{has_key, update_key_f64, update_key_logical};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::extract::{ExtractOptions, extract_plane_from_cube};
+use fitscube_rs::extract::{
+    ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube, extract_planes_from_cube,
+};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 
@@ -280,4 +282,54 @@ fn extract_checks_index_against_target_axis() {
     extract_chan(&cube, 3).unwrap();
     let err = extract_chan(&cube, 4).unwrap_err();
     assert!(matches!(err, FitsCubeError::ChannelMissing(_)), "{err:?}");
+}
+
+fn read_plane_data(path: &Path) -> Vec<f32> {
+    let mut f = FitsFile::open(path).unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    hdu.read_image(&mut f).unwrap()
+}
+
+/// A cube stored in an image extension, behind an empty primary HDU.
+#[test]
+fn extract_from_image_extension() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), false);
+    let ext_cube = dir.path().join("ext.fits");
+    let mut src = FitsFile::open(&cube).unwrap();
+    let mut dst = FitsFile::create(&ext_cube).open().unwrap();
+    let mut status = 0;
+    unsafe { fitsio::sys::ffcopy(src.as_raw(), dst.as_raw(), 0, &mut status) };
+    assert_eq!(status, 0);
+    drop(dst);
+
+    let opts = ExtractOptions {
+        hdu_index: 1,
+        channel_index: Some(2),
+        ..Default::default()
+    };
+    let plane = extract_plane_from_cube(&ext_cube, &opts).unwrap();
+    assert!(read_plane_data(&plane).iter().all(|&v| v == 2.0));
+    assert_eq!(read_i64_key(&plane, "NAXIS3"), 1);
+    assert_eq!(read_f64_key(&plane, "CRVAL3"), 1.2e9);
+}
+
+#[test]
+fn extract_every_plane() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), true);
+    let planes = extract_planes_from_cube(&cube, &ExtractPlanesOptions::default()).unwrap();
+    assert_eq!(planes.len(), 4);
+    for (i, plane) in planes.iter().enumerate() {
+        assert_eq!(plane, &dir.path().join(format!("c.channel-{i}.fits")));
+        assert!(read_plane_data(plane).iter().all(|&v| v == i as f32));
+        assert!((read_f64_key(plane, "BMAJ") - 0.01 * (i as f64 + 1.0)).abs() < 1e-6);
+        assert!(!has_key(plane, "CASAMBM").unwrap());
+    }
+    let opts = ExtractPlanesOptions {
+        output_paths: Some(vec![dir.path().join("a.fits")]),
+        ..Default::default()
+    };
+    let err = extract_planes_from_cube(&cube, &opts).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ShapeMismatch(_)), "{err:?}");
 }

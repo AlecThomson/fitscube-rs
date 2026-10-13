@@ -1,42 +1,65 @@
-//! Extract a single plane (channel or timestep) from a FITS cube.
+//! Pull planes back out of a cube.
 //!
-//! Port of `fitscube.extract`. Finds the FREQ/TIME axis, slices the requested
-//! index out of the cube (keeping the axis with length 1, as `np.take` +
-//! `np.expand_dims` do), rewrites the axis WCS for the extracted plane, copies
-//! the per-channel beam from the `BEAMS` table when present, and writes a new
-//! FITS image.
+//! Only the requested plane is read. The output keeps the cube's axes, with the
+//! FREQ/TIME axis of length 1, and takes its beam from the `BEAMS` table.
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
-use fitsio::FitsFile;
-use ndarray::{ArrayD, Axis, IxDyn};
-
-use crate::error::{FitsCubeError, Result};
-use crate::keys::read_opt_key;
 use atfits_rs::{
-    PixelType, copy_header_only, delete_key, resize_image, update_key_f64, update_key_i64,
+    HeaderGeom, TargetAxis, delete_key, key_string, resize_image, update_key_f64, update_key_i64,
 };
+use fitsio::errors::check_status;
+use fitsio::{FileOpenMode, FitsFile, sys};
+use rayon::prelude::*;
 
-/// cfitsio `BAD_HDU_NUM`, returned when no HDU has the requested name.
-const BAD_HDU_NUM: i32 = 301;
+use crate::beams::{Beam, read_beam_table};
+use crate::combine::{check_exists, in_pool};
+use crate::error::{FitsCubeError, Result};
+use crate::partial::PartialFile;
+use crate::pixels::{Pixel, disable_scaling, read_pixels, with_pixel_type, write_pixels};
+use crate::wcs::{find_axis, world};
 
-/// What to pull out of the cube.
+/// Which plane of which HDU to extract, and where to.
 #[derive(Debug, Clone, Default)]
 pub struct ExtractOptions {
     pub hdu_index: usize,
+    /// Frequency channel. Exactly one of this and `time_index` must be set.
     pub channel_index: Option<usize>,
     pub time_index: Option<usize>,
     pub overwrite: bool,
+    /// Defaults to `cube.channel-N.fits` (or `timestep-N`) beside the cube.
     pub output_path: Option<PathBuf>,
 }
 
-/// The resolved extraction target.
+/// Options for [`extract_planes_from_cube`].
+#[derive(Debug, Clone)]
+pub struct ExtractPlanesOptions {
+    pub hdu_index: usize,
+    pub overwrite: bool,
+    /// One path per channel. Defaults to `cube.channel-N.fits` beside the cube.
+    pub output_paths: Option<Vec<PathBuf>>,
+    /// Planes written at once. `None` uses every core.
+    pub max_workers: Option<usize>,
+}
+
+impl Default for ExtractPlanesOptions {
+    fn default() -> Self {
+        Self {
+            hdu_index: 0,
+            overwrite: false,
+            output_paths: None,
+            max_workers: Some(4),
+        }
+    }
+}
+
+/// The axis to extract along, and the index along it.
 struct TargetIndex {
     axis_name: &'static str,
     axis_index: usize,
     output_name: &'static str,
 }
 
-/// Resolve the target axis/index, enforcing exactly one of channel/time.
 fn create_target_index(opts: &ExtractOptions) -> Result<TargetIndex> {
     match (opts.channel_index, opts.time_index) {
         (Some(_), Some(_)) => Err(FitsCubeError::InvalidSpec(
@@ -58,328 +81,228 @@ fn create_target_index(opts: &ExtractOptions) -> Result<TargetIndex> {
     }
 }
 
-/// Build the default output path: `cube.fits` → `cube.channel-5.fits`. Mirrors
-/// `get_output_path`.
-fn default_output_path(input: &Path, target: &TargetIndex) -> PathBuf {
+/// `cube.fits` to `cube.channel-5.fits`.
+fn default_output_path(input: &Path, output_name: &str, index: usize) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     let ext = input.extension().unwrap_or_default().to_string_lossy();
-    parent.join(format!(
-        "{stem}.{}-{}.{ext}",
-        target.output_name, target.axis_index
-    ))
+    parent.join(format!("{stem}.{output_name}-{index}.{ext}"))
 }
 
-/// FREQ/TIME axis location within a cube header (read from a given HDU).
-struct AxisWcs {
-    fits_idx: usize,
-    crpix: f64,
-    crval: f64,
-    /// CDi_i, or CDELTi * PCi_i.
-    step: f64,
-}
-
-impl AxisWcs {
-    /// World value of the 0-based plane `index` (FITS pixels are 1-based).
-    fn world(&self, index: usize) -> f64 {
-        self.crval + (index as f64 + 1.0 - self.crpix) * self.step
-    }
-}
-
-fn find_axis(fptr: &mut FitsFile, hdu_index: usize, name: &str) -> Result<AxisWcs> {
-    let hdu = fptr.hdu(hdu_index)?;
-    let naxis: i64 = hdu.read_key(fptr, "NAXIS")?;
-    for axis in 1..=naxis {
-        let Some(ctype) = read_opt_key::<String>(&hdu, fptr, &format!("CTYPE{axis}"))? else {
-            continue;
-        };
-        if ctype.contains(name) {
-            let mut key = |k: String| read_opt_key::<f64>(&hdu, fptr, &k);
-            let crpix = key(format!("CRPIX{axis}"))?.unwrap_or(0.0);
-            let crval = key(format!("CRVAL{axis}"))?.unwrap_or(0.0);
-            let step = match key(format!("CD{axis}_{axis}"))? {
-                Some(cd) => cd,
-                None => {
-                    key(format!("CDELT{axis}"))?.unwrap_or(1.0)
-                        * key(format!("PC{axis}_{axis}"))?.unwrap_or(1.0)
-                }
-            };
-            return Ok(AxisWcs {
-                fits_idx: axis as usize,
-                crpix,
-                crval,
-                step,
-            });
-        }
-    }
-    Err(FitsCubeError::TargetAxisMissing(format!(
-        "Did not find the {name} axis"
-    )))
-}
-
-/// Does the header advertise a CASA beam table (`CASAMBM = T`)?
-fn contains_beam_table(fptr: &mut FitsFile, hdu_index: usize) -> bool {
-    let Ok(hdu) = fptr.hdu(hdu_index) else {
-        return false;
-    };
-    if let Ok(b) = hdu.read_key::<bool>(fptr, "CASAMBM") {
-        return b;
-    }
-    if let Ok(s) = hdu.read_key::<String>(fptr, "CASAMBM") {
-        return matches!(s.trim(), "T" | "TRUE");
-    }
-    false
-}
-
-/// Read the dims (FITS order) and BITPIX of the chosen HDU.
-fn read_geom(fptr: &mut FitsFile, hdu_index: usize) -> Result<(Vec<usize>, i64)> {
-    let hdu = fptr.hdu(hdu_index)?;
-    let naxis: i64 = hdu.read_key(fptr, "NAXIS")?;
-    let bitpix: i64 = hdu.read_key(fptr, "BITPIX")?;
-    let mut dims = Vec::with_capacity(naxis as usize);
-    for i in 1..=naxis {
-        let n: i64 = hdu.read_key(fptr, &format!("NAXIS{i}"))?;
-        dims.push(n as usize);
-    }
-    Ok((dims, bitpix))
-}
-
-/// Beam (degrees) for a channel, read from the `BEAMS` binary table.
-struct BeamRow {
-    bmaj_deg: f64,
-    bmin_deg: f64,
-    bpa_deg: f64,
-}
-
-/// The beam of plane `index` from the `BEAMS` table, or `None` if the file has
-/// no such table.
-fn extract_beam_row(path: &Path, index: usize) -> Result<Option<BeamRow>> {
-    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let hdu = match fptr.hdu("BEAMS") {
-        Ok(hdu) => hdu,
-        Err(fitsio::errors::Error::Fits(e)) if e.status == BAD_HDU_NUM => {
-            tracing::warn!("{} sets CASAMBM but has no BEAMS table", path.display());
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let bmaj: Vec<f32> = hdu.read_col(&mut fptr, "BMAJ")?;
-    let bmin: Vec<f32> = hdu.read_col(&mut fptr, "BMIN")?;
-    let bpa: Vec<f32> = hdu.read_col(&mut fptr, "BPA")?;
-    if index >= bmaj.len() {
-        return Err(FitsCubeError::ChannelMissing(format!(
-            "beam table has {} rows, requested index {index}",
-            bmaj.len()
-        )));
-    }
-    // Table stores BMAJ/BMIN in arcsec, BPA in deg.
-    Ok(Some(BeamRow {
-        bmaj_deg: bmaj[index] as f64 / 3600.0,
-        bmin_deg: bmin[index] as f64 / 3600.0,
-        bpa_deg: bpa[index] as f64,
-    }))
-}
-
-/// Extract a plane buffer at `axis_index` along the cube's `array_idx`
-/// (numpy-order) axis, keeping that axis with length 1.
-fn take_plane<T: Clone + 'static>(
-    flat: Vec<T>,
-    dims_fits: &[usize],
-    array_idx: usize,
-    axis_index: usize,
-) -> Result<Vec<T>> {
-    // numpy (C-order) shape is the reverse of the FITS dim order.
-    let shape_np: Vec<usize> = dims_fits.iter().rev().copied().collect();
-    let arr = ArrayD::from_shape_vec(IxDyn(&shape_np), flat)
-        .map_err(|e| FitsCubeError::ShapeMismatch(e.to_string()))?;
-    let plane = arr.index_axis(Axis(array_idx), axis_index); // axis removed
-    let plane = plane.insert_axis(Axis(array_idx)); // restore length-1 axis
-    let std = plane.as_standard_layout();
-    Ok(std.iter().cloned().collect())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_plane<T: CubeImage>(
-    out_path: &Path,
-    cube: &Path,
-    hdu_index: usize,
-    dims_out_fits: &[usize],
-    bitpix: i64,
-    plane: &[T],
-    axis: &AxisWcs,
-    axis_index: usize,
-    beam: Option<&BeamRow>,
-    drop_casambm: bool,
-    overwrite: bool,
-) -> Result<()> {
-    if out_path.exists() {
-        if same_file(cube, out_path) {
-            return Err(FitsCubeError::OutputIsInput(out_path.to_path_buf()));
-        }
-        if overwrite {
-            std::fs::remove_file(out_path)?;
-        } else {
-            return Err(FitsCubeError::OutputExists(out_path.to_path_buf()));
-        }
-    }
-    // Copy the (chosen-HDU) header, resize to the plane shape, rewrite the axis.
-    copy_header_only_hdu(cube, out_path, hdu_index)?;
-    let mut fptr = FitsFile::edit(out_path.to_string_lossy().as_ref())?;
-    fptr.primary_hdu()?;
-    resize_image(&mut fptr, bitpix, dims_out_fits)?;
-
-    let fi = axis.fits_idx;
-    // The rest of the axis WCS is copied with the header
-    update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
-    update_key_f64(&mut fptr, &format!("CRVAL{fi}"), axis.world(axis_index))?;
-
-    if let Some(b) = beam {
-        update_key_f64(&mut fptr, "BMAJ", b.bmaj_deg)?;
-        update_key_f64(&mut fptr, "BMIN", b.bmin_deg)?;
-        update_key_f64(&mut fptr, "BPA", b.bpa_deg)?;
-    }
-    if drop_casambm {
-        delete_key(&mut fptr, "CASAMBM")?;
-    }
-
-    T::write_primary(&mut fptr, plane)?;
-    Ok(())
-}
-
-/// Whether two existing paths name the same file.
-fn same_file(a: &Path, b: &Path) -> bool {
-    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
-}
-
-/// Copy only the header of a specific input HDU into a fresh primary HDU.
-fn copy_header_only_hdu(input: &Path, output: &Path, hdu_index: usize) -> Result<()> {
-    if hdu_index == 0 {
-        return Ok(copy_header_only(input, output)?);
-    }
-    // For non-primary HDUs, fall back to copying via the safe API path: open the
-    // HDU, then reuse the primary-copy machinery is not applicable, so error
-    // clearly (cubes are stored in the primary HDU in practice).
-    Err(FitsCubeError::NotImplemented(format!(
-        "extracting from non-primary HDU index {hdu_index}"
-    )))
-}
-
-/// Minimal write helper so extract can be generic over pixel precision.
-trait CubeImage: Clone + ndarray::ScalarOperand + 'static {
-    fn read_primary(fptr: &mut FitsFile, hdu_index: usize) -> Result<Vec<Self>>;
-    fn write_primary(fptr: &mut FitsFile, data: &[Self]) -> Result<()>;
-}
-
-macro_rules! impl_cube_image {
-    ($t:ty) => {
-        impl CubeImage for $t {
-            fn read_primary(fptr: &mut FitsFile, hdu_index: usize) -> Result<Vec<Self>> {
-                let hdu = fptr.hdu(hdu_index)?;
-                Ok(hdu.read_image(fptr)?)
-            }
-            fn write_primary(fptr: &mut FitsFile, data: &[Self]) -> Result<()> {
-                let hdu = fptr.primary_hdu()?;
-                hdu.write_image(fptr, data)?;
-                Ok(())
-            }
-        }
-    };
-}
-impl_cube_image!(f32);
-impl_cube_image!(f64);
-
-#[allow(clippy::too_many_arguments)]
-fn extract_typed<T: CubeImage>(
-    cube: &Path,
-    opts: &ExtractOptions,
-    target: &TargetIndex,
-    out_path: &Path,
-    dims: &[usize],
-    bitpix: i64,
-    axis: AxisWcs,
-    beam: Option<BeamRow>,
-    drop_casambm: bool,
-) -> Result<()> {
-    let array_idx = dims.len() - axis.fits_idx; // numpy axis = len - fits_idx
-    let axis_len = dims[axis.fits_idx - 1];
-    if target.axis_index >= axis_len {
-        return Err(FitsCubeError::ChannelMissing(format!(
-            "index {} outside cube axis of length {axis_len}",
-            target.axis_index
-        )));
-    }
-
-    let mut fptr = FitsFile::open(cube.to_string_lossy().as_ref())?;
-    let flat: Vec<T> = T::read_primary(&mut fptr, opts.hdu_index)?;
-    drop(fptr);
-
-    let plane = take_plane(flat, dims, array_idx, target.axis_index)?;
-
-    let mut dims_out = dims.to_vec();
-    dims_out[axis.fits_idx - 1] = 1;
-
-    write_plane::<T>(
-        out_path,
-        cube,
-        opts.hdu_index,
-        &dims_out,
-        bitpix,
-        &plane,
-        &axis,
-        target.axis_index,
-        beam.as_ref(),
-        drop_casambm,
-        opts.overwrite,
-    )
-}
-
-/// Extract a plane from `cube`, writing a new FITS image and returning its path.
+/// Extract one plane of `cube` into a new image and return its path.
 pub fn extract_plane_from_cube(cube: &Path, opts: &ExtractOptions) -> Result<PathBuf> {
     let target = create_target_index(opts)?;
     let out_path = opts
         .output_path
         .clone()
-        .unwrap_or_else(|| default_output_path(cube, &target));
-
-    crate::combine::check_exists(cube)?;
-    let mut fptr = FitsFile::open(cube.to_string_lossy().as_ref())?;
-    let axis = find_axis(&mut fptr, opts.hdu_index, target.axis_name)?;
-    let (dims, bitpix) = read_geom(&mut fptr, opts.hdu_index)?;
-    let has_beam_table = contains_beam_table(&mut fptr, opts.hdu_index);
-    drop(fptr);
-
-    let beam = if has_beam_table {
-        extract_beam_row(cube, target.axis_index)?
-    } else {
-        None
-    };
-    let drop_casambm = has_beam_table;
-
-    match PixelType::from_bitpix(bitpix) {
-        PixelType::F32 => extract_typed::<f32>(
-            cube,
-            opts,
-            &target,
-            &out_path,
-            &dims,
-            bitpix,
-            axis,
-            beam,
-            drop_casambm,
-        )?,
-        PixelType::F64 => extract_typed::<f64>(
-            cube,
-            opts,
-            &target,
-            &out_path,
-            &dims,
-            bitpix,
-            axis,
-            beam,
-            drop_casambm,
-        )?,
-    }
+        .unwrap_or_else(|| default_output_path(cube, target.output_name, target.axis_index));
+    let (mut fptr, source) = Cube::open(cube, opts.hdu_index, target.axis_name)?;
+    source.write_plane(&mut fptr, target.axis_index, &out_path, opts.overwrite)?;
     Ok(out_path)
+}
+
+/// Extract every channel of `cube` into its own image and return their paths.
+///
+/// The cube and its beam table are read once, rather than once per plane.
+pub fn extract_planes_from_cube(cube: &Path, opts: &ExtractPlanesOptions) -> Result<Vec<PathBuf>> {
+    let (_, source) = Cube::open(cube, opts.hdu_index, "FREQ")?;
+    let n = source.n_planes();
+    let out_paths = match &opts.output_paths {
+        None => (0..n)
+            .map(|i| default_output_path(cube, "channel", i))
+            .collect(),
+        Some(paths) if paths.len() == n => paths.clone(),
+        Some(paths) => {
+            return Err(FitsCubeError::ShapeMismatch(format!(
+                "Have {} output paths for a cube of {n} channels",
+                paths.len()
+            )));
+        }
+    };
+    let pool = opts
+        .max_workers
+        .map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n.max(1))
+                .build()
+        })
+        .transpose()?;
+    in_pool(pool.as_ref(), || {
+        out_paths.par_iter().enumerate().try_for_each_init(
+            || None,
+            |fptr: &mut Option<FitsFile>, (i, out)| {
+                let fptr = match fptr {
+                    Some(fptr) => fptr,
+                    None => fptr.insert(source.reopen()?),
+                };
+                source.write_plane(fptr, i, out, opts.overwrite)
+            },
+        )
+    })?;
+    Ok(out_paths)
+}
+
+/// The parts of a cube that every extracted plane needs.
+struct Cube {
+    path: PathBuf,
+    hdu_index: usize,
+    geom: HeaderGeom,
+    axis: TargetAxis,
+    /// The header says beams are in a table (CASAMBM).
+    casambm: bool,
+    beams: Option<Vec<Beam>>,
+}
+
+impl Cube {
+    fn open(path: &Path, hdu_index: usize, axis_name: &str) -> Result<(FitsFile, Self)> {
+        check_exists(path)?;
+        let mut fptr = FitsFile::open(path)?;
+        fptr.hdu(hdu_index)?;
+        let geom = HeaderGeom::from_file(&mut fptr)?;
+        let axis = find_axis(&mut fptr, axis_name)?.ok_or_else(|| {
+            FitsCubeError::TargetAxisMissing(format!("Did not find the {axis_name} axis"))
+        })?;
+        let casambm = matches!(
+            key_string(&mut fptr, "CASAMBM")?.as_deref().map(str::trim),
+            Some("T" | "TRUE" | "True" | "true")
+        );
+        let beams = if casambm {
+            let beams = read_beam_table(&mut fptr)?;
+            if beams.is_none() {
+                tracing::warn!("{} sets CASAMBM but has no BEAMS table", path.display());
+            }
+            fptr.hdu(hdu_index)?;
+            beams
+        } else {
+            None
+        };
+        let cube = Self {
+            path: path.to_path_buf(),
+            hdu_index,
+            geom,
+            axis,
+            casambm,
+            beams,
+        };
+        Ok((fptr, cube))
+    }
+
+    fn reopen(&self) -> Result<FitsFile> {
+        let mut fptr = FitsFile::open(&self.path)?;
+        fptr.hdu(self.hdu_index)?;
+        Ok(fptr)
+    }
+
+    fn n_planes(&self) -> usize {
+        self.geom.dims[self.axis.fits_idx - 1]
+    }
+
+    /// Write plane `index` to `out`, read through `fptr`.
+    fn write_plane(
+        &self,
+        fptr: &mut FitsFile,
+        index: usize,
+        out: &Path,
+        overwrite: bool,
+    ) -> Result<()> {
+        let n = self.n_planes();
+        if index >= n {
+            return Err(FitsCubeError::ChannelMissing(format!(
+                "index {index} outside cube axis of length {n}"
+            )));
+        }
+        let beam = match &self.beams {
+            Some(beams) => Some(*beams.get(index).ok_or_else(|| {
+                FitsCubeError::ChannelMissing(format!(
+                    "beam table has {} rows, requested index {index}",
+                    beams.len()
+                ))
+            })?),
+            None => None,
+        };
+        if out.exists() {
+            if same_file(&self.path, out) {
+                return Err(FitsCubeError::OutputIsInput(out.to_path_buf()));
+            }
+            if !overwrite {
+                return Err(FitsCubeError::OutputExists(out.to_path_buf()));
+            }
+        }
+        let partial = PartialFile::create(out)?;
+        with_pixel_type!(
+            self.geom.bitpix,
+            copy_plane(self, fptr, index, beam, &partial.path)
+        )?;
+        partial.persist(out)
+    }
+}
+
+/// Copy plane `index` of the cube open at `src`, with the cube's header
+/// adjusted for one plane, into a new file at `path`.
+fn copy_plane<T: Pixel>(
+    cube: &Cube,
+    src: &mut FitsFile,
+    index: usize,
+    beam: Option<Beam>,
+    path: &Path,
+) -> Result<()> {
+    let fi = cube.axis.fits_idx;
+    let mut ranges: Vec<(usize, usize)> = cube.geom.dims.iter().map(|&n| (0, n)).collect();
+    ranges[fi - 1] = (index, index + 1);
+    let mut plane: Vec<T> = Vec::new();
+    // Stored values are copied as they are, under the cube's BSCALE and BZERO
+    disable_scaling(src)?;
+    read_pixels(src, &cube.geom.dims, Some(&ranges), None, &mut plane)?;
+
+    let mut out = create_with_header(src, path)?;
+    let mut dims = cube.geom.dims.clone();
+    dims[fi - 1] = 1;
+    resize_image(&mut out, cube.geom.bitpix, &dims)?;
+    update_key_i64(&mut out, &format!("CRPIX{fi}"), 1)?;
+    update_key_f64(&mut out, &format!("CRVAL{fi}"), world(&cube.axis, index))?;
+    if let Some(b) = beam {
+        update_key_f64(&mut out, "BMAJ", b.major_deg)?;
+        update_key_f64(&mut out, "BMIN", b.minor_deg)?;
+        update_key_f64(&mut out, "BPA", b.pa_deg)?;
+    }
+    if cube.casambm {
+        delete_key(&mut out, "CASAMBM")?;
+    }
+    for key in ["CHECKSUM", "DATASUM"] {
+        delete_key(&mut out, key)?;
+    }
+    disable_scaling(&mut out)?;
+    write_pixels(&mut out, &plane)?;
+    let mut status = 0;
+    // SAFETY: `out` is open; flushing reports write errors that close hides.
+    unsafe { sys::ffflus(out.as_raw(), &mut status) };
+    check_status(status)?;
+    Ok(())
+}
+
+/// A new file at `path` (replacing it) holding the header of the current HDU
+/// of `src` as its primary header, with no data written yet.
+fn create_with_header(src: &mut FitsFile, path: &Path) -> Result<FitsFile> {
+    let name = CString::new(format!("!{}", path.display()))
+        .map_err(|e| FitsCubeError::Atfits(e.to_string()))?;
+    let mut raw = std::ptr::null_mut();
+    let mut status = 0;
+    // SAFETY: `name` is a valid C string and `raw` receives the new handle,
+    // which `FitsFile::from_raw` then owns.
+    unsafe {
+        sys::ffinit(&mut raw, name.as_ptr(), &mut status);
+        check_status(status)?;
+        let mut out = FitsFile::from_raw(raw, FileOpenMode::READWRITE)?;
+        // Converts an image extension header to a primary one
+        sys::ffcphd(src.as_raw(), out.as_raw(), &mut status);
+        check_status(status)?;
+        out.primary_hdu()?;
+        Ok(out)
+    }
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 #[cfg(test)]
@@ -388,12 +311,7 @@ mod tests {
 
     #[test]
     fn output_path_default() {
-        let target = TargetIndex {
-            axis_name: "FREQ",
-            axis_index: 5,
-            output_name: "channel",
-        };
-        let p = default_output_path(Path::new("/data/cube.fits"), &target);
+        let p = default_output_path(Path::new("/data/cube.fits"), "channel", 5);
         assert_eq!(p, PathBuf::from("/data/cube.channel-5.fits"));
     }
 
@@ -411,24 +329,5 @@ mod tests {
     fn neither_index_errors() {
         let opts = ExtractOptions::default();
         assert!(create_target_index(&opts).is_err());
-    }
-
-    #[test]
-    fn take_middle_plane_of_cube() {
-        // FITS dims [nx=2, ny=2, nchan=3]; numpy shape [3,2,2].
-        // Channel values: chan c filled with c.
-        let dims_fits = vec![2usize, 2, 3];
-        let mut flat = vec![0.0f64; 12];
-        // numpy C-order index = ((c)*2 + r)*2 + col, with shape [3,2,2].
-        for c in 0..3 {
-            for r in 0..2 {
-                for col in 0..2 {
-                    flat[(c * 2 + r) * 2 + col] = c as f64;
-                }
-            }
-        }
-        // FREQ axis is fits_idx 3 → array_idx = 3 - 3 = 0.
-        let plane = take_plane(flat, &dims_fits, 0, 1).unwrap();
-        assert_eq!(plane, vec![1.0; 4]);
     }
 }

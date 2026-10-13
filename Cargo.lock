@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "atfits-rs"
-version = "1.0.4"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "011d363b7b0c1eb34ed3683071c66c0a9d0dcc1875d3ef1b9e20fea924047563"
+checksum = "7795408ec38d7b717c4facb70752cdaffe55feb4cf5dbf17c4d8e34b591761f7"
 dependencies = [
  "fitsio",
  "thiserror",
