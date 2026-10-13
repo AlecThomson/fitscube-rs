@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 
 use fitscube_rs::combine::{CombineOptions, combine_fits};
+use fitscube_rs::error::FitsCubeError;
 use fitscube_rs::extract::{ExtractOptions, extract_plane_from_cube};
+use fitscube_rs::fits_io::{has_key, update_key_f64, update_key_logical};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 
@@ -158,4 +160,117 @@ fn varying_beams_emit_beam_table() {
     assert_eq!(bmaj.len(), 3);
     // First channel BMAJ ≈ 0.01 deg = 36 arcsec.
     assert!((bmaj[0] - 36.0).abs() < 1e-3);
+}
+
+/// Four 3x3 planes 100 MHz apart from 1 GHz, combined into `c.fits`.
+fn small_cube(dir: &Path, beams: bool) -> PathBuf {
+    let files: Vec<PathBuf> = (0..4)
+        .map(|i| {
+            let p = dir.join(format!("f{i}.fits"));
+            let beam = beams.then_some(0.01 * (i as f64 + 1.0));
+            write_image(&p, 3, 3, 1.0e9 + 1.0e8 * i as f64, i as f32, beam);
+            p
+        })
+        .collect();
+    let cube = dir.join("c.fits");
+    combine_fits(&files, &cube, &CombineOptions::default()).unwrap();
+    cube
+}
+
+fn extract_chan(cube: &Path, chan: usize) -> fitscube_rs::Result<PathBuf> {
+    let opts = ExtractOptions {
+        channel_index: Some(chan),
+        ..Default::default()
+    };
+    extract_plane_from_cube(cube, &opts)
+}
+
+#[test]
+fn extract_refuses_to_overwrite_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), false);
+    let opts = ExtractOptions {
+        channel_index: Some(1),
+        overwrite: true,
+        output_path: Some(dir.path().join(".").join("c.fits")),
+        ..Default::default()
+    };
+    let err = extract_plane_from_cube(&cube, &opts).unwrap_err();
+    assert!(matches!(err, FitsCubeError::OutputIsInput(_)), "{err:?}");
+    assert_eq!(read_i64_key(&cube, "NAXIS3"), 4);
+}
+
+#[test]
+fn extract_uses_crpix() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), false);
+    // The same axis, referenced to the third plane
+    let mut f = FitsFile::edit(cube.to_string_lossy().as_ref()).unwrap();
+    update_key_f64(&mut f, "CRPIX3", 3.0).unwrap();
+    update_key_f64(&mut f, "CRVAL3", 1.2e9).unwrap();
+    drop(f);
+    let plane = extract_chan(&cube, 1).unwrap();
+    assert_eq!(read_f64_key(&plane, "CRVAL3"), 1.1e9);
+    assert_eq!(read_f64_key(&plane, "CRPIX3"), 1.0);
+
+    // PCi_i scales CDELTi
+    let mut f = FitsFile::edit(cube.to_string_lossy().as_ref()).unwrap();
+    update_key_f64(&mut f, "CDELT3", 5e7).unwrap();
+    update_key_f64(&mut f, "PC3_3", 2.0).unwrap();
+    drop(f);
+    let opts = ExtractOptions {
+        channel_index: Some(1),
+        overwrite: true,
+        ..Default::default()
+    };
+    let plane = extract_plane_from_cube(&cube, &opts).unwrap();
+    assert_eq!(read_f64_key(&plane, "CRVAL3"), 1.1e9);
+}
+
+#[test]
+fn extract_without_beam_table_continues() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), false);
+    let mut f = FitsFile::edit(cube.to_string_lossy().as_ref()).unwrap();
+    update_key_logical(&mut f, "CASAMBM", true).unwrap();
+    drop(f);
+    let plane = extract_chan(&cube, 1).unwrap();
+    assert!(!has_key(&plane, "BMAJ").unwrap());
+    assert!(!has_key(&plane, "CASAMBM").unwrap());
+}
+
+#[test]
+fn extract_reports_short_beam_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let cube = small_cube(dir.path(), true);
+    let plane = extract_chan(&cube, 3).unwrap();
+    assert!((read_f64_key(&plane, "BMAJ") - 0.04).abs() < 1e-6);
+
+    // Drop the last two rows of the table
+    let mut f = FitsFile::edit(cube.to_string_lossy().as_ref()).unwrap();
+    f.hdu("BEAMS").unwrap();
+    let mut status = 0;
+    unsafe { fitsio::sys::ffdrow(f.as_raw(), 3, 2, &mut status) };
+    assert_eq!(status, 0);
+    drop(f);
+    let err = extract_chan(&cube, 3).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ChannelMissing(_)), "{err:?}");
+}
+
+/// The index is checked against the FREQ axis, not NAXIS1.
+#[test]
+fn extract_checks_index_against_target_axis() {
+    let dir = tempfile::tempdir().unwrap();
+    let files: Vec<PathBuf> = (0..4)
+        .map(|i| {
+            let p = dir.path().join(format!("f{i}.fits"));
+            write_image(&p, 3, 2, 1.0e9 + 1.0e8 * i as f64, i as f32, None);
+            p
+        })
+        .collect();
+    let cube = dir.path().join("c.fits");
+    combine_fits(&files, &cube, &CombineOptions::default()).unwrap();
+    extract_chan(&cube, 3).unwrap();
+    let err = extract_chan(&cube, 4).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ChannelMissing(_)), "{err:?}");
 }

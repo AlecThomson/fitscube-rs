@@ -62,9 +62,8 @@ fn freq_at_first_pixel(path: &Path) -> Result<f64> {
             }
         };
         let cunit: Option<String> = read_opt_key(&hdu, &mut fptr, &format!("CUNIT{i}"))?;
-        let scale = freq_unit_to_hz(cunit.as_deref()).map_err(|e| {
-            FitsCubeError::InvalidSpec(format!("{}: {e}", path.display()))
-        })?;
+        let scale = freq_unit_to_hz(cunit.as_deref())
+            .map_err(|e| FitsCubeError::InvalidSpec(format!("{}: {e}", path.display())))?;
         return Ok((crval + (1.0 - crpix) * step) * scale);
     }
     Err(FitsCubeError::TargetAxisMissing(format!(

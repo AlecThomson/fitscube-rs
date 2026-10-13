@@ -83,6 +83,10 @@ pub enum FitsCubeError {
     #[error("output file {0} already exists (use overwrite)")]
     OutputExists(PathBuf),
 
+    /// The output path is the input file.
+    #[error("output {0} is the input file")]
+    OutputIsInput(PathBuf),
+
     /// Mutually exclusive spectral-input options were combined, or a count
     /// mismatch was detected.
     #[error("invalid spectral input: {0}")]
