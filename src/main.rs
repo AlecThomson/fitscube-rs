@@ -77,6 +77,9 @@ struct CombineArgs {
     /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
     #[arg(long)]
     no_blank_zero_beams: bool,
+    /// Gzip the cube to OUT_CUBE.gz once it is written.
+    #[arg(long)]
+    compress: bool,
 }
 
 #[derive(Args)]
@@ -161,7 +164,12 @@ fn run_combine(args: CombineArgs) -> Result<()> {
     let specs = combine_fits(&args.file_list, &args.out_cube, &options)
         .context("combining FITS files into a cube")?;
 
-    info!("Written cube to {}", args.out_cube.display());
+    let out_cube = if args.compress {
+        fitscube_rs::compress::compress_cube(&args.out_cube).context("compressing the cube")?
+    } else {
+        args.out_cube.clone()
+    };
+    info!("Written cube to {}", out_cube.display());
 
     // Write the axis values alongside the cube, as the original CLI does.
     let body: String = specs.iter().map(|v| format!("{v}\n")).collect::<String>();

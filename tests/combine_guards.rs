@@ -1094,3 +1094,14 @@ fn failed_combine_leaves_no_partial_cube() {
         .collect();
     assert!(names.is_empty(), "{names:?}");
 }
+
+#[test]
+fn cli_compress() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    fitscubers(&files, &out_cube, &["--compress"]);
+    assert!(!out_cube.exists());
+    assert_eq!(read_planes(&dir.path().join("cube.fits.gz")).len(), 4);
+    assert!(dir.path().join("cube.specs_Hz.txt").exists());
+}

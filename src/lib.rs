@@ -19,6 +19,7 @@ pub mod beams;
 pub mod bounding_box;
 pub mod checks;
 pub mod combine;
+pub mod compress;
 pub mod error;
 pub mod extract;
 mod partial;
