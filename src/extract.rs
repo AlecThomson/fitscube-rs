@@ -11,10 +11,10 @@ use fitsio::FitsFile;
 use ndarray::{ArrayD, Axis, IxDyn};
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{
+use crate::keys::read_opt_key;
+use atfits_rs::{
     PixelType, copy_header_only, delete_key, resize_image, update_key_f64, update_key_i64,
 };
-use crate::keys::read_opt_key;
 
 /// cfitsio `BAD_HDU_NUM`, returned when no HDU has the requested name.
 const BAD_HDU_NUM: i32 = 301;

@@ -13,7 +13,7 @@ use num_traits::Float;
 use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::HeaderGeom;
+use atfits_rs::HeaderGeom;
 
 /// Pixel bounds of the valid (finite) region of a 2D image.
 ///

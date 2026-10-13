@@ -5,11 +5,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use atfits_rs::{delete_key, update_key_f64, update_key_i64, update_key_str};
 use fitscube_rs::bounding_box::{BoundingBox, get_common_bounding_box};
 use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_i64, update_key_str};
 use fitscube_rs::specs::read_spec_from_header;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};

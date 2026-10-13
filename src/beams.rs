@@ -9,7 +9,7 @@ use fitsio::FitsFile;
 use fitsio::tables::{ColumnDataType, ColumnDescription};
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{has_key, read_key_f64};
+use atfits_rs::{has_key, read_key_f64};
 
 /// A restoring beam in degrees. Any field may be NaN (no beam in header).
 #[derive(Debug, Clone, Copy, PartialEq)]

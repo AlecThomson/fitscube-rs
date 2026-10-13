@@ -4,10 +4,10 @@
 //! under plain `cargo test`.
 use std::path::{Path, PathBuf};
 
+use atfits_rs::{has_key, update_key_f64, update_key_logical};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
 use fitscube_rs::extract::{ExtractOptions, extract_plane_from_cube};
-use fitscube_rs::fits_io::{has_key, update_key_f64, update_key_logical};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 

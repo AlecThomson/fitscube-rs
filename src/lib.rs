@@ -21,7 +21,6 @@ pub mod checks;
 pub mod combine;
 pub mod error;
 pub mod extract;
-pub mod fits_io;
 mod keys;
 pub mod progress;
 pub mod specs;

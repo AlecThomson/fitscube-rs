@@ -24,12 +24,12 @@ use crate::checks::{
     Storage, check_matching_axes, check_matching_shapes, check_matching_storage, read_inputs_axes,
 };
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{
+use crate::progress::{progress_bar, spinner};
+use crate::specs::parse_specs;
+use atfits_rs::{
     CubeLayout, HeaderGeom, create_mem_cube, delete_key, extract_header_layout, find_target_axis,
     has_key, update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
 };
-use crate::progress::{progress_bar, spinner};
-use crate::specs::parse_specs;
 
 /// FITS records are 2880 bytes; headers and the data unit are each padded up to
 /// a whole number of these blocks.

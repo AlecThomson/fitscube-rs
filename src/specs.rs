@@ -9,8 +9,8 @@ use fitsio::FitsFile;
 use hifitime::Epoch;
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{HeaderGeom, read_key_f64, read_key_string};
 use crate::keys::read_opt_key;
+use atfits_rs::{HeaderGeom, read_key_f64, read_key_string};
 
 /// Result of parsing the spectral/temporal axis.
 #[derive(Debug, Clone)]
