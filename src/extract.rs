@@ -340,6 +340,7 @@ pub fn extract_plane_from_cube(cube: &Path, opts: &ExtractOptions) -> Result<Pat
         .clone()
         .unwrap_or_else(|| default_output_path(cube, &target));
 
+    crate::combine::check_exists(cube)?;
     let mut fptr = FitsFile::open(cube.to_string_lossy().as_ref())?;
     let axis = find_axis(&mut fptr, opts.hdu_index, target.axis_name)?;
     let (dims, bitpix) = read_geom(&mut fptr, opts.hdu_index)?;

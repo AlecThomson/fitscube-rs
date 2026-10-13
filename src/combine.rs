@@ -649,6 +649,19 @@ fn encode_float_channel<T: FloatPixel>(
     })
 }
 
+/// A missing file as an [`std::io::ErrorKind::NotFound`] error, which cfitsio
+/// would only report as "could not open the named file".
+pub(crate) fn check_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} does not exist", path.display()),
+    )
+    .into())
+}
+
 /// Run `f` in `pool`, or in rayon's global pool when there is none.
 fn in_pool<R: Send>(pool: Option<&ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
     match pool {
@@ -668,6 +681,9 @@ pub fn combine_fits(
         return Err(FitsCubeError::Other("file_list is empty".to_string()));
     }
     let float_bitpix = float_length_to_bitpix(options.float_length)?;
+    for path in file_list {
+        check_exists(path)?;
+    }
 
     // The cube's header comes from the first input, so every input must share
     // its pixel grid, axes and Stokes parameter.
