@@ -1,4 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
 //! Python bindings (`fitscube_rs._fitscube_rs`).
 //!
 //! Thin wrappers over [`crate::combine`] and [`crate::extract`]; all the FITS
@@ -41,7 +40,7 @@ fn to_py_err(e: FitsCubeError) -> PyErr {
         // FileNotFoundError, PermissionError, ... by error kind
         FitsCubeError::Io(e) => e.into(),
         FitsCubeError::Fits(_) => PyOSError::new_err(msg),
-        FitsCubeError::ThreadPool(_) => PyRuntimeError::new_err(msg),
+        FitsCubeError::ThreadPool(_) | FitsCubeError::WorkerPanic => PyRuntimeError::new_err(msg),
         _ => PyValueError::new_err(msg),
     }
 }

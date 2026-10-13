@@ -232,7 +232,7 @@ mod tests {
                 &values,
                 |v| v.to_string(),
                 "x",
-                FitsCubeError::Other
+                FitsCubeError::InvalidSpec
             )
             .unwrap(),
             1
@@ -246,7 +246,7 @@ mod tests {
             &values,
             |v| v.to_string(),
             "x",
-            FitsCubeError::Other,
+            FitsCubeError::InvalidSpec,
         )
         .unwrap_err()
         .to_string();

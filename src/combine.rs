@@ -135,10 +135,7 @@ fn float_length_to_bitpix(float_length: Option<u8>) -> Result<Option<i64>> {
         None => Ok(None),
         Some(32) => Ok(Some(-32)),
         Some(64) => Ok(Some(-64)),
-        Some(other) => Err(FitsCubeError::Other(format!(
-            "floating={other} is not a valid FITS float precision; use 32 or 64 \
-             (FITS defines only −32 and −64 bit IEEE floats)"
-        ))),
+        Some(other) => Err(FitsCubeError::InvalidFloatLength(other)),
     }
 }
 
@@ -411,7 +408,8 @@ fn crop_to_box<T: Clone>(
 ) -> Result<Vec<T>> {
     let mut out = Vec::with_capacity(flat.len() / (nrows * ncols) * bb.x_span * bb.y_span);
     for plane in flat.chunks(nrows * ncols) {
-        let view = ArrayView2::from_shape((nrows, ncols), plane)?;
+        let view = ArrayView2::from_shape((nrows, ncols), plane)
+            .map_err(|e| FitsCubeError::ShapeMismatch(e.to_string()))?;
         let sub = view.slice(ndarray::s![bb.xmin..bb.xmax, bb.ymin..bb.ymax]);
         out.extend(sub.iter().cloned());
     }
@@ -599,13 +597,13 @@ fn write_cube_raw(
                 (0..n_chan).into_par_iter().try_for_each(|new_chan| -> Result<()> {
                     let bytes = encode_channel(new_chan)?;
                     if bytes.len() as u64 != plane_bytes {
-                        return Err(FitsCubeError::Other(format!(
+                        return Err(FitsCubeError::ShapeMismatch(format!(
                             "channel {new_chan} holds {} bytes, but the cube expects {plane_bytes}",
                             bytes.len()
                         )));
                     }
                     tx.send((new_chan, bytes))
-                        .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
+                        .map_err(|_| FitsCubeError::Cancelled)?;
                     Ok(())
                 })
             });
@@ -630,9 +628,7 @@ fn write_cube_raw(
             bar.finish_with_message("planes written");
         }
 
-        producer
-            .join()
-            .map_err(|_| FitsCubeError::Other("reader thread panicked".to_string()))?
+        producer.join().map_err(|_| FitsCubeError::WorkerPanic)?
     })
 }
 
@@ -678,7 +674,7 @@ pub fn combine_fits(
     options: &CombineOptions,
 ) -> Result<Vec<f64>> {
     if file_list.is_empty() {
-        return Err(FitsCubeError::Other("file_list is empty".to_string()));
+        return Err(FitsCubeError::NoInputs);
     }
     let float_bitpix = float_length_to_bitpix(options.float_length)?;
     for path in file_list {
@@ -841,11 +837,7 @@ pub fn combine_fits(
     // which an integer cube cannot hold.
     let blank_channels = missing.iter().zip(&zero_beam).any(|(&m, &z)| m || z);
     if init.bitpix > 0 && (blank_channels || options.invalidate_zeros) {
-        return Err(FitsCubeError::Other(format!(
-            "Blank channels and invalidated zeros are written as NaNs, which integer \
-             output data (BITPIX={}) cannot hold. Pass float_length=32 or 64 (--floating).",
-            init.bitpix
-        )));
+        return Err(FitsCubeError::BlanksNeedFloat(init.bitpix));
     }
 
     // Input image of each output channel; None ⇒ a blank (NaN) plane.
@@ -889,9 +881,7 @@ pub fn combine_fits(
             ))
         })?,
         other => {
-            return Err(FitsCubeError::Other(format!(
-                "unsupported output BITPIX={other}"
-            )));
+            return Err(FitsCubeError::UnsupportedBitpix(other));
         }
     }
 

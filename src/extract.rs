@@ -190,7 +190,8 @@ fn take_plane<T: Clone + 'static>(
 ) -> Result<Vec<T>> {
     // numpy (C-order) shape is the reverse of the FITS dim order.
     let shape_np: Vec<usize> = dims_fits.iter().rev().copied().collect();
-    let arr = ArrayD::from_shape_vec(IxDyn(&shape_np), flat)?;
+    let arr = ArrayD::from_shape_vec(IxDyn(&shape_np), flat)
+        .map_err(|e| FitsCubeError::ShapeMismatch(e.to_string()))?;
     let plane = arr.index_axis(Axis(array_idx), axis_index); // axis removed
     let plane = plane.insert_axis(Axis(array_idx)); // restore length-1 axis
     let std = plane.as_standard_layout();
@@ -258,8 +259,8 @@ fn copy_header_only_hdu(input: &Path, output: &Path, hdu_index: usize) -> Result
     // For non-primary HDUs, fall back to copying via the safe API path: open the
     // HDU, then reuse the primary-copy machinery is not applicable, so error
     // clearly (cubes are stored in the primary HDU in practice).
-    Err(FitsCubeError::Other(format!(
-        "extracting from non-primary HDU index {hdu_index} is not supported"
+    Err(FitsCubeError::NotImplemented(format!(
+        "extracting from non-primary HDU index {hdu_index}"
     )))
 }
 

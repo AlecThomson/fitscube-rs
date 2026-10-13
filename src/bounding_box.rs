@@ -141,7 +141,8 @@ pub fn get_bounding_box_for_fits(
             }
         }
     }
-    let view = ArrayView2::from_shape((nrows, ncols), &data)?;
+    let view = ArrayView2::from_shape((nrows, ncols), &data)
+        .map_err(|e| FitsCubeError::ShapeMismatch(e.to_string()))?;
     Ok(create_bound_box_plane(&view))
 }
 
@@ -172,15 +173,13 @@ pub fn extract_common_bounding_box(boxes: &[Option<BoundingBox>]) -> Result<Boun
     let valid: Vec<&BoundingBox> = boxes.iter().filter_map(|b| b.as_ref()).collect();
 
     if valid.is_empty() {
-        return Err(FitsCubeError::Other(
-            "No valid input boxes to consider".to_string(),
-        ));
+        return Err(FitsCubeError::NoValidData);
     }
 
     let shape0 = valid[0].original_shape;
     if !valid.iter().all(|b| b.original_shape == shape0) {
-        return Err(FitsCubeError::Other(
-            "Different shapes, and not sure this is really supported or meaningful".to_string(),
+        return Err(FitsCubeError::ShapeMismatch(
+            "bounding boxes come from planes of different shapes".to_string(),
         ));
     }
 
