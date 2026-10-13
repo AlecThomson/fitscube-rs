@@ -9,7 +9,7 @@ use fitscube_rs::bounding_box::{BoundingBox, get_common_bounding_box};
 use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_str};
+use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_i64, update_key_str};
 use fitscube_rs::specs::read_spec_from_header;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
@@ -929,4 +929,68 @@ fn nan_spec_is_refused() {
         let err = combine_fits(&files, &out_cube, &opts).unwrap_err();
         assert!(matches!(err, FitsCubeError::InvalidSpec(_)), "{err:?}");
     }
+}
+
+fn int16_planes(dir: &Path) -> Vec<PathBuf> {
+    make_planes(dir, "int", &specs(), |i| Plane {
+        value: i as f64 * 10.0,
+        int16: true,
+        ..Default::default()
+    })
+}
+
+/// Stored integers under differing scales cannot share one integer cube, but
+/// decode to a float cube.
+#[test]
+fn differing_integer_scaling() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = int16_planes(dir.path());
+    for (i, path) in files.iter().enumerate() {
+        set_key(path, "BSCALE", 1.0 + i as f64);
+    }
+    let out_cube = dir.path().join("cube.fits");
+    let err = combine_fits(&files, &out_cube, &options()).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ScalingMismatch(_)), "{err:?}");
+    assert!(!out_cube.exists());
+
+    let opts = CombineOptions {
+        float_length: Some(32),
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    for (chan, plane) in read_planes(&out_cube).iter().enumerate() {
+        let value = chan as f64 * 10.0 * (1.0 + chan as f64);
+        assert!(all_eq(plane, value), "channel {chan}: {:?}", &plane[..2]);
+    }
+}
+
+/// An integer cube keeps the inputs' BLANK, and a float cube decodes BLANK
+/// pixels to NaN.
+#[test]
+fn integer_blank_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = int16_planes(dir.path());
+    for path in &files {
+        edit(path, |f| update_key_i64(f, "BLANK", 10).unwrap());
+    }
+    let out_cube = dir.path().join("cube.fits");
+    combine_fits(&files, &out_cube, &options()).unwrap();
+    assert_eq!(read_i64(&out_cube, "BLANK"), 10);
+    let planes = read_planes(&out_cube);
+    // cfitsio does not apply BLANK when reading as f64 without a null value
+    assert!(all_eq(&planes[1], 10.0));
+
+    let opts = CombineOptions {
+        float_length: Some(64),
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    let planes = read_planes(&out_cube);
+    assert!(all_eq(&planes[0], 0.0));
+    assert!(all_nan(&planes[1]));
+    assert!(all_eq(&planes[2], 20.0));
+
+    edit(&files[3], |f| update_key_i64(f, "BLANK", 11).unwrap());
+    let err = combine_fits(&files, &out_cube, &options()).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ScalingMismatch(_)), "{err:?}");
 }

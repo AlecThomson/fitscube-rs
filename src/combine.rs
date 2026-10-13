@@ -12,17 +12,20 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 
 use fitsio::FitsFile;
+use fitsio::errors::check_status;
+use fitsio::hdu::HduInfo;
 use ndarray::ArrayView2;
 use rayon::prelude::*;
 
 use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, get_common_bounding_box};
-use crate::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
+use crate::checks::{
+    Storage, check_matching_axes, check_matching_shapes, check_matching_storage, read_inputs_axes,
+};
 use crate::error::{FitsCubeError, Result};
 use crate::fits_io::{
-    CubeElem, CubeLayout, HeaderGeom, create_mem_cube, delete_key, extract_header_layout,
-    find_target_axis, has_key, read_key_f64, update_key_f64, update_key_i64, update_key_logical,
-    update_key_str, write_comment,
+    CubeLayout, HeaderGeom, create_mem_cube, delete_key, extract_header_layout, find_target_axis,
+    has_key, update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
 };
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
@@ -227,7 +230,8 @@ fn create_output_cube(
     overwrite: bool,
     time_domain_mode: bool,
     bbox: Option<&BoundingBox>,
-    float_length: Option<u8>,
+    out_bitpix: i64,
+    storage: &Storage,
 ) -> Result<(InitResult, CubeLayout)> {
     if out_cube.exists() && !overwrite {
         return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));
@@ -300,9 +304,6 @@ fn create_output_cube(
         )));
     }
 
-    let in_bitpix = geom.bitpix;
-    let out_bitpix = float_length_to_bitpix(float_length)?.unwrap_or(in_bitpix);
-
     // Detect transform-matrix presence before we clobber anything.
     let has_cd = has_key(template, "CD1_1")?;
     let has_pc = has_key(template, "PC1_1")?;
@@ -319,13 +320,17 @@ fn create_output_cube(
     let mut fptr = create_mem_cube(template, out_bitpix, &dims)?;
 
     // Integer cubes copy the inputs' stored values (see
-    // [`process_plane_raw_int`]), so they keep the scaling that decodes them;
+    // [`process_plane_raw_int`]), so they keep the cards that decode them;
     // float cubes hold decoded values and must not.
     if out_bitpix > 0 {
-        for key in ["BSCALE", "BZERO"] {
-            if let Some(value) = read_key_f64(template, key)? {
-                update_key_f64(&mut fptr, key, value)?;
-            }
+        if let Some(bscale) = storage.bscale {
+            update_key_f64(&mut fptr, "BSCALE", bscale)?;
+        }
+        if let Some(bzero) = storage.bzero {
+            update_key_f64(&mut fptr, "BZERO", bzero)?;
+        }
+        if let Some(blank) = storage.blank {
+            update_key_i64(&mut fptr, "BLANK", blank)?;
         }
     }
 
@@ -411,31 +416,73 @@ fn crop_to_box<T: Clone>(
     Ok(out)
 }
 
-/// NAXIS2 (rows) and NAXIS1 (cols) of the open image, for a bounding-box crop.
-fn plane_dims(fptr: &mut FitsFile) -> Result<(usize, usize)> {
+/// Pixel count and (NAXIS2, NAXIS1) of the open primary image.
+fn image_size(fptr: &mut FitsFile) -> Result<(usize, (usize, usize))> {
     let hdu = fptr.primary_hdu()?;
-    // FITS order: NAXIS1 = cols (fast), NAXIS2 = rows.
-    let ncols: i64 = hdu.read_key(fptr, "NAXIS1")?;
-    let nrows: i64 = hdu.read_key(fptr, "NAXIS2")?;
-    Ok((nrows as usize, ncols as usize))
+    match &hdu.info {
+        HduInfo::ImageInfo { shape, .. } if shape.len() >= 2 => {
+            let n = shape.iter().product();
+            Ok((n, (shape[shape.len() - 2], shape[shape.len() - 1])))
+        }
+        HduInfo::ImageInfo { shape, .. } => {
+            Err(FitsCubeError::UnsupportedNaxis(shape.len() as i64))
+        }
+        _ => Err(FitsCubeError::UnsupportedNaxis(0)),
+    }
+}
+
+/// Float pixel types a cube is written in.
+trait FloatPixel: num_traits::Float + BeBytes + Send + Sync + 'static {
+    /// cfitsio datatype code.
+    const DATATYPE: u32;
+}
+
+impl FloatPixel for f32 {
+    const DATATYPE: u32 = fitsio::sys::TFLOAT;
+}
+
+impl FloatPixel for f64 {
+    const DATATYPE: u32 = fitsio::sys::TDOUBLE;
+}
+
+/// Read all `n` pixels of the open primary image as `T`. Pixels equal to an
+/// integer image's BLANK come back as NaN.
+fn read_decoded<T: FloatPixel>(fptr: &mut FitsFile, n: usize) -> Result<Vec<T>> {
+    let mut out = vec![T::zero(); n];
+    let mut nulval = T::nan();
+    let mut anynul = 0;
+    let mut status = 0;
+    // SAFETY: `out` holds the `n` elements requested, and `nulval` has the
+    // type named by `T::DATATYPE`.
+    unsafe {
+        fitsio::sys::ffgpv(
+            fptr.as_raw(),
+            T::DATATYPE as _,
+            1,
+            n as _,
+            (&mut nulval as *mut T).cast(),
+            out.as_mut_ptr().cast(),
+            &mut anynul,
+            &mut status,
+        );
+    }
+    check_status(status)?;
+    Ok(out)
 }
 
 /// Read one input image as type `T`, apply bounding box / zero-invalidation, and
 /// return the flat (row-major) buffer of every plane in it.
-fn process_plane<T: CubeElem + num_traits::Float>(
+fn process_plane<T: FloatPixel>(
     path: &Path,
     bbox: Option<&BoundingBox>,
     invalidate_zeros: bool,
 ) -> Result<Vec<T>> {
-    // Single open per plane. Only read the spatial dims (extra header keys) when
-    // a bounding box actually needs them.
     let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let dims = bbox.map(|_| plane_dims(&mut fptr)).transpose()?;
-    let flat: Vec<T> = T::read_full(&mut fptr)?;
-
-    let mut plane: Vec<T> = match (bbox, dims) {
-        (Some(bb), Some((nrows, ncols))) => crop_to_box(&flat, nrows, ncols, bb)?,
-        _ => flat,
+    let (n, (nrows, ncols)) = image_size(&mut fptr)?;
+    let flat: Vec<T> = read_decoded(&mut fptr, n)?;
+    let mut plane: Vec<T> = match bbox {
+        Some(bb) => crop_to_box(&flat, nrows, ncols, bb)?,
+        None => flat,
     };
 
     if invalidate_zeros {
@@ -458,8 +505,7 @@ fn process_plane<T: CubeElem + num_traits::Float>(
 /// would not be.
 fn process_plane_raw_int(path: &Path, bbox: Option<&BoundingBox>) -> Result<Vec<i64>> {
     let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let dims = plane_dims(&mut fptr)?;
-    let n: usize = HeaderGeom::read(path)?.dims.iter().product();
+    let (n, (nrows, ncols)) = image_size(&mut fptr)?;
     let mut flat = vec![0i64; n];
     let mut anynul = 0;
     let mut status = 0;
@@ -478,14 +524,9 @@ fn process_plane_raw_int(path: &Path, bbox: Option<&BoundingBox>) -> Result<Vec<
             &mut status,
         );
     }
-    if status != 0 {
-        return Err(FitsCubeError::Other(format!(
-            "cfitsio error {status} reading raw integers from {}",
-            path.display()
-        )));
-    }
+    check_status(status)?;
     match bbox {
-        Some(bb) => crop_to_box(&flat, dims.0, dims.1, bb),
+        Some(bb) => crop_to_box(&flat, nrows, ncols, bb),
         None => Ok(flat),
     }
 }
@@ -596,7 +637,7 @@ fn write_cube_raw(
 }
 
 /// Encode one float channel: the input plane in `T`, or NaNs for a blank one.
-fn encode_float_channel<T: CubeElem + num_traits::Float + BeBytes>(
+fn encode_float_channel<T: FloatPixel>(
     input: Option<&Path>,
     plane_len: usize,
     bbox: Option<&BoundingBox>,
@@ -618,14 +659,18 @@ pub fn combine_fits(
     if file_list.is_empty() {
         return Err(FitsCubeError::Other("file_list is empty".to_string()));
     }
-    // Validate precision early.
-    float_length_to_bitpix(options.float_length)?;
+    let float_bitpix = float_length_to_bitpix(options.float_length)?;
 
     // The cube's header comes from the first input, so every input must share
     // its pixel grid, axes and Stokes parameter.
     let input_axes = read_inputs_axes(file_list)?;
     check_matching_shapes(file_list, &input_axes)?;
     check_matching_axes(file_list, &input_axes)?;
+    let storage = input_axes[0].storage;
+    let out_bitpix = float_bitpix.unwrap_or(storage.bitpix);
+    if out_bitpix > 0 {
+        check_matching_storage(file_list, &input_axes)?;
+    }
 
     let spec_info = parse_specs(
         file_list,
@@ -737,7 +782,8 @@ pub fn combine_fits(
         options.overwrite,
         options.time_domain_mode,
         final_bbox.as_ref(),
-        options.float_length,
+        out_bitpix,
+        &storage,
     )?;
 
     // Map each output channel to an input index (None ⇒ blank/missing plane).

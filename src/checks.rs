@@ -11,6 +11,7 @@ use fitsio::FitsFile;
 use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
+use crate::keys::read_opt_key;
 
 /// The header cards of one input that must match across all inputs.
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +23,17 @@ pub struct InputAxes {
     /// FITS Stokes code of each plane along the Stokes axis, or `None` if
     /// there is no Stokes axis.
     pub stokes_codes: Option<Vec<i64>>,
+    /// How pixels are stored on disk.
+    pub storage: Storage,
+}
+
+/// BITPIX, and the BSCALE, BZERO and BLANK cards (`None` where absent).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Storage {
+    pub bitpix: i64,
+    pub bscale: Option<f64>,
+    pub bzero: Option<f64>,
+    pub blank: Option<i64>,
 }
 
 /// FITS Stokes symbols (FITS WCS paper III, table 7), indexed by `code + 8`.
@@ -75,10 +87,18 @@ pub fn read_input_axes(path: &Path) -> Result<InputAxes> {
         }
     };
 
+    let storage = Storage {
+        bitpix: hdu.read_key(&mut fptr, "BITPIX")?,
+        bscale: read_opt_key(&hdu, &mut fptr, "BSCALE")?,
+        bzero: read_opt_key(&hdu, &mut fptr, "BZERO")?,
+        blank: read_opt_key(&hdu, &mut fptr, "BLANK")?,
+    };
+
     Ok(InputAxes {
         shape,
         ctypes,
         stokes_codes,
+        storage,
     })
 }
 
@@ -169,6 +189,21 @@ pub fn check_matching_axes(file_list: &[PathBuf], axes: &[InputAxes]) -> Result<
         },
         "the same Stokes parameter",
         FitsCubeError::StokesMismatch,
+    )?;
+    Ok(())
+}
+
+/// Confirm every input stores its pixels with the same BITPIX, BSCALE, BZERO
+/// and BLANK. An integer cube copies the stored values under one set of them.
+pub fn check_matching_storage(file_list: &[PathBuf], axes: &[InputAxes]) -> Result<()> {
+    let storage: Vec<Storage> = axes.iter().map(|a| a.storage).collect();
+    check_values_match(
+        file_list,
+        &storage,
+        |s| format!("{s:?}"),
+        "the same BITPIX and integer scaling for an integer cube (pass float_length=32 or 64, \
+         --floating, to write decoded values instead)",
+        FitsCubeError::ScalingMismatch,
     )?;
     Ok(())
 }

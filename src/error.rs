@@ -61,6 +61,11 @@ pub enum FitsCubeError {
     #[error("Stokes mismatch: {0}")]
     StokesMismatch(String),
 
+    /// Integer inputs differ in BITPIX, BSCALE, BZERO or BLANK, so their stored
+    /// values cannot share one integer cube.
+    #[error("scaling mismatch: {0}")]
+    ScalingMismatch(String),
+
     /// The combine axis is not the slowest-varying axis of the cube.
     ///
     /// Equivalent to Python `AxisOrderException`.
