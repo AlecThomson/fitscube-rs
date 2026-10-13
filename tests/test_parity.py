@@ -154,6 +154,9 @@ def test_varying_beams_beam_table(tmp_path):
             np.testing.assert_allclose(
                 rs_beams[col], ref_beams[col], rtol=1e-4, atol=1e-4
             )
+        rs_units = [c.unit for c in rs_hdul["BEAMS"].columns]
+        assert rs_units == [c.unit for c in ref_hdul["BEAMS"].columns]
+        assert rs_units == ["arcsec", "arcsec", "deg", None, None]
 
 
 def _make_stokes_images(d: Path, freqs, beams, stokes_code: float) -> list[Path]:
@@ -390,8 +393,11 @@ def _compare_full(ref: Path, rs: Path) -> None:
         if "BEAMS" not in ref_names:
             return
         ref_beams, rs_beams = ref_hdul["BEAMS"], rs_hdul["BEAMS"]
-        for key in ("NCHAN", "NPOL"):
+        for key in ("NCHAN", "NPOL", "TUNIT1", "TUNIT2", "TUNIT3"):
             assert rs_beams.header[key] == ref_beams.header[key], key
+        assert len(rs_beams.columns) == len(ref_beams.columns)
+        for rs_col, ref_col in zip(rs_beams.columns, ref_beams.columns, strict=True):
+            assert (rs_col.name, rs_col.unit) == (ref_col.name, ref_col.unit)
         for col in ("BMAJ", "BMIN", "BPA"):
             np.testing.assert_allclose(
                 rs_beams.data[col], ref_beams.data[col], rtol=1e-6, err_msg=col

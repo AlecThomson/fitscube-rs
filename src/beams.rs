@@ -231,6 +231,10 @@ pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32])
     let beam_hdu = fptr.hdu("BEAMS")?;
     beam_hdu.write_key(fptr, "NCHAN", nchan as i64)?;
     beam_hdu.write_key(fptr, "NPOL", stokes_idx.len() as i64)?;
+    // casacore reads the beam units from TUNITn
+    for (col, unit) in [(1, "arcsec"), (2, "arcsec"), (3, "deg")] {
+        beam_hdu.write_key(fptr, &format!("TUNIT{col}"), unit)?;
+    }
 
     Ok(())
 }

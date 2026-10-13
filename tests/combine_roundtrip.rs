@@ -160,6 +160,9 @@ fn varying_beams_emit_beam_table() {
     assert_eq!(bmaj.len(), 3);
     // First channel BMAJ ≈ 0.01 deg = 36 arcsec.
     assert!((bmaj[0] - 36.0).abs() < 1e-3);
+    for (key, unit) in [("TUNIT1", "arcsec"), ("TUNIT2", "arcsec"), ("TUNIT3", "deg")] {
+        assert_eq!(beams.read_key::<String>(&mut f, key).unwrap(), unit);
+    }
 }
 
 /// Four 3x3 planes 100 MHz apart from 1 GHz, combined into `c.fits`.
