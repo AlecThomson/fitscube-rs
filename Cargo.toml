@@ -5,6 +5,7 @@ name = "fitscube-rs"
 # wheel/sdist version follows automatically.
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Alec Thomson"]
 license = "BSD-3-Clause"
 description = "Combine single-frequency/single-time FITS images into a FITS cube (Rust port of fitscube)"
@@ -50,7 +51,7 @@ pyo3 = { version = "0.26", features = ["extension-module"], optional = true }
 numpy = { version = "0.26", optional = true }
 pyo3-stub-gen = { version = "0.22.3", optional = true }
 # Shared low-level cfitsio helpers (pixel I/O, header editing, image creation).
-atfits-rs = "=1.0.4"
+atfits-rs = "=1.1.0"
 # cfitsio linkage is controlled by the crate-level `fitsio-src` feature (see
 # [features] above).
 fitsio = { version = "0.21" }
@@ -65,6 +66,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = { version = "0.17", features = ["rayon"] }
+flate2 = "1"
 
 [dev-dependencies]
 approx = "0.5"

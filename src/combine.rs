@@ -1,110 +1,64 @@
 //! Combine single-plane FITS images into a cube.
 //!
-//! Port of `fitscube.combine_fits`. The pipeline: parse the spectral/temporal
-//! axis ([`crate::specs`]), read beams ([`crate::beams`]), sort the inputs,
-//! optionally compute a common bounding box, build the output header, then
-//! stream each plane into the cube with raw I/O (reading/decoding in parallel,
-//! writing on a single thread). The data unit bypasses cfitsio entirely to avoid
-//! its zero-fill pass — see [`mem_header`] and [`write_cube_raw`].
-use std::fs::OpenOptions;
-use std::os::unix::fs::FileExt;
+//! The cube header is built in memory from the first input. Planes are read
+//! and byte-swapped in parallel and written by one thread at their offsets in
+//! a temporary file, which replaces the output once everything is written.
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::sync_channel;
 
+use atfits_rs::{
+    CubeLayout, create_mem_cube, delete_key, extract_header_layout, key_f64, update_key_f64,
+    update_key_i64, update_key_logical, update_key_str, write_comment,
+};
 use fitsio::FitsFile;
-use fitsio::errors::check_status;
-use fitsio::hdu::HduInfo;
-use ndarray::ArrayView2;
+use num_traits::Float;
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use crate::beams::{self, Beam};
 use crate::bounding_box::{BoundingBox, get_common_bounding_box};
 use crate::checks::{
-    Storage, check_matching_axes, check_matching_shapes, check_matching_storage, read_inputs_axes,
+    InputHeader, check_matching_axes, check_matching_shapes, check_matching_storage,
+    read_input_headers,
 };
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{
-    CubeLayout, HeaderGeom, create_mem_cube, delete_key, extract_header_layout, find_target_axis,
-    has_key, update_key_f64, update_key_i64, update_key_logical, update_key_str, write_comment,
-};
+use crate::partial::PartialFile;
+use crate::pixels::{Pixel, as_bytes, bbox_ranges, disable_scaling, read_pixels, swap_to_be};
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
 
-/// FITS records are 2880 bytes; headers and the data unit are each padded up to
-/// a whole number of these blocks.
+/// FITS headers and data units are padded to 2880-byte blocks.
 const FITS_BLOCK: u64 = 2880;
 
-fn round_up_to_block(n: u64) -> u64 {
-    n.div_ceil(FITS_BLOCK) * FITS_BLOCK
-}
-
-/// A pixel value serialisable to big-endian FITS byte order.
-///
-/// The combine writer bypasses cfitsio for the data unit (see [`write_cube_raw`]),
-/// so it byte-swaps each plane itself — exactly as the Python reference does with
-/// `ndarray.astype(">f4")` before a raw `tofile`.
-trait BeBytes: Copy {
-    /// On-disk width in bytes (FITS `|BITPIX|/8`).
-    const WIDTH: usize;
-    fn extend_be(self, buf: &mut Vec<u8>);
-}
-
-impl BeBytes for f32 {
-    const WIDTH: usize = 4;
-    fn extend_be(self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_bits().to_be_bytes());
-    }
-}
-
-impl BeBytes for f64 {
-    const WIDTH: usize = 8;
-    fn extend_be(self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(&self.to_bits().to_be_bytes());
-    }
-}
-
-macro_rules! impl_be_bytes_int {
-    ($($t:ty),*) => {$(
-        impl BeBytes for $t {
-            const WIDTH: usize = std::mem::size_of::<$t>();
-            fn extend_be(self, buf: &mut Vec<u8>) {
-                buf.extend_from_slice(&self.to_be_bytes());
-            }
-        }
-    )*};
-}
-impl_be_bytes_int!(i16, i32, i64);
-
-/// Options for [`combine_fits`], mirroring the keyword arguments of the Python
-/// `combine_fits`.
+/// Options for [`combine_fits`]. Field names follow fitscube's arguments.
 #[derive(Debug, Clone)]
 pub struct CombineOptions {
+    /// Text file of frequencies (Hz) or times (MJD s), one per input.
     pub spec_file: Option<PathBuf>,
+    /// Frequencies (Hz) or times (MJD s), one per input.
     pub spec_list: Option<Vec<f64>>,
+    /// Stack in input order and label the axis with channel numbers.
     pub ignore_spec: bool,
+    /// Fill gaps in a regular axis with NaN channels.
     pub create_blanks: bool,
     pub overwrite: bool,
     /// Threads used to read input images. `None` uses every core.
     pub max_workers: Option<usize>,
+    /// Combine along time (DATE-OBS) instead of frequency.
     pub time_domain_mode: bool,
+    /// Trim to the box around the finite pixels of all inputs.
     pub bounding_box: bool,
-    /// A bounding box to trim to, used as is (it takes precedence over
-    /// `bounding_box`), so that separate cubes — e.g. an image cube and its
-    /// weights cube — can be forced onto a common pixel grid. See
-    /// [`crate::bounding_box::get_common_bounding_box`].
+    /// Trim to this box. Takes precedence over `bounding_box`.
     pub supplied_bounding_box: Option<BoundingBox>,
+    /// Treat pixels that are exactly zero as NaN.
     pub invalidate_zeros: bool,
-    /// Output floating-point precision in bits. Only 32 and 64 are valid FITS
-    /// float widths (BITPIX −32 / −64); other values are rejected.
+    /// Output float width in bits, 32 or 64. `None` keeps the input BITPIX.
     pub float_length: Option<u8>,
-    /// Draw progress bars/spinners to stderr. The CLI sets this; the Python
-    /// bindings leave it off so importing the module stays silent.
+    /// Draw progress bars on stderr.
     pub progress: bool,
-    /// Blank (NaN) any input image whose restoring beam is exactly zero.
-    /// wsclean writes such a beam when a plane holds no fitted PSF — e.g. the
-    /// model image `-fit-spectral-pol` plants into a channel — and those planes
-    /// are not comparable to the rest of the cube. Defaults to `true`.
+    /// Blank (NaN) inputs whose beam has a zero axis.
     pub blank_zero_beams: bool,
 }
 
@@ -128,31 +82,273 @@ impl Default for CombineOptions {
     }
 }
 
-/// Validate `float_length` and map it to a FITS BITPIX, or `None` to inherit
-/// the input precision.
+/// Combine `file_list` into the cube at `out_cube` and return the values of
+/// its axis (Hz, or MJD seconds in time mode).
+pub fn combine_fits(
+    file_list: &[PathBuf],
+    out_cube: &Path,
+    options: &CombineOptions,
+) -> Result<Vec<f64>> {
+    if file_list.is_empty() {
+        return Err(FitsCubeError::NoInputs);
+    }
+    let float_bitpix = float_length_to_bitpix(options.float_length)?;
+    for path in file_list {
+        check_exists(path)?;
+    }
+    if out_cube.exists() && !options.overwrite {
+        return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));
+    }
+    let pool = options
+        .max_workers
+        .map(|n| ThreadPoolBuilder::new().num_threads(n.max(1)).build())
+        .transpose()?;
+    let pool = pool.as_ref();
+
+    let headers = in_pool(pool, || read_input_headers(file_list))?;
+    check_matching_shapes(file_list, &headers)?;
+    check_matching_axes(file_list, &headers)?;
+    let first = &headers[0];
+    let bitpix = float_bitpix.unwrap_or(first.storage.bitpix);
+    if bitpix > 0 {
+        check_matching_storage(file_list, &headers)?;
+    }
+
+    let channels = plan_channels(file_list, &headers, options)?;
+    let bbox = bounding_box(file_list, first, options, pool)?;
+    if let Some(bb) = &bbox {
+        tracing::info!("The final bounding box is: {bb:?}");
+    }
+
+    let stokes_idx = beams::get_polarisation(first.stokes_codes.as_ref().map(Vec::len));
+    let varying_beams = channels
+        .beams
+        .as_ref()
+        .is_some_and(|b| !beams::is_single_beam(b));
+    // Fail before any data is written
+    if varying_beams {
+        beams::beam_table_pol(&stokes_idx)?;
+    }
+    let has_blanks = channels.inputs.iter().any(Option::is_none);
+    if bitpix > 0 && (has_blanks || options.invalidate_zeros) {
+        return Err(FitsCubeError::BlanksNeedFloat(bitpix));
+    }
+
+    let header = CubeHeader {
+        template: &file_list[0],
+        first,
+        specs: &channels.specs,
+        ignore_spec: options.ignore_spec,
+        varying_beams,
+        time_domain_mode: options.time_domain_mode,
+        bbox: bbox.as_ref(),
+        bitpix,
+    };
+    let (layout, plane_len) = header.build()?;
+
+    let partial = PartialFile::create(out_cube)?;
+    let file = File::options().read(true).write(true).open(&partial.path)?;
+    let source = PlaneSource {
+        files: file_list,
+        headers: &headers,
+        inputs: &channels.inputs,
+        bbox: bbox.as_ref(),
+        invalidate_zeros: options.invalidate_zeros,
+        plane_len,
+    };
+    let writer = CubeWriter {
+        file: &file,
+        layout: &layout,
+        n_chan: channels.inputs.len(),
+        plane_len,
+        pool,
+        progress: options.progress,
+    };
+    match bitpix {
+        -32 => writer.write(|c, buf| source.read_float::<f32>(c, buf))?,
+        -64 => writer.write(|c, buf| source.read_float::<f64>(c, buf))?,
+        8 => writer.write(|c, buf| source.read_raw::<u8>(c, buf))?,
+        16 => writer.write(|c, buf| source.read_raw::<i16>(c, buf))?,
+        32 => writer.write(|c, buf| source.read_raw::<i32>(c, buf))?,
+        64 => writer.write(|c, buf| source.read_raw::<i64>(c, buf))?,
+        other => return Err(FitsCubeError::UnsupportedBitpix(other)),
+    }
+    drop(file);
+
+    if varying_beams && let Some(beams) = &channels.beams {
+        let mut fptr = FitsFile::edit(&partial.path)?;
+        beams::write_beam_table(&mut fptr, beams, &stokes_idx)?;
+    }
+    partial.persist(out_cube)?;
+    Ok(channels.specs)
+}
+
 fn float_length_to_bitpix(float_length: Option<u8>) -> Result<Option<i64>> {
     match float_length {
         None => Ok(None),
         Some(32) => Ok(Some(-32)),
         Some(64) => Ok(Some(-64)),
-        Some(other) => Err(FitsCubeError::Other(format!(
-            "floating={other} is not a valid FITS float precision; use 32 or 64 \
-             (FITS defines only −32 and −64 bit IEEE floats)"
-        ))),
+        Some(other) => Err(FitsCubeError::InvalidFloatLength(other)),
     }
+}
+
+/// A missing input as an io `NotFound` error, which cfitsio reports only as a
+/// failure to open.
+pub(crate) fn check_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("{} does not exist", path.display()),
+    )
+    .into())
+}
+
+/// Run `f` in `pool`, or in rayon's global pool when there is none.
+pub(crate) fn in_pool<R: Send>(pool: Option<&ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
+    match pool {
+        Some(pool) => pool.install(f),
+        None => f(),
+    }
+}
+
+/// The channels of the cube in axis order.
+struct Channels {
+    specs: Vec<f64>,
+    /// Index of each channel's input, `None` for a NaN plane.
+    inputs: Vec<Option<usize>>,
+    /// Beam of each channel, if any input has one.
+    beams: Option<Vec<Beam>>,
+}
+
+fn plan_channels(
+    file_list: &[PathBuf],
+    headers: &[InputHeader],
+    options: &CombineOptions,
+) -> Result<Channels> {
+    let spec_info = parse_specs(
+        file_list,
+        headers,
+        options.spec_file.as_deref(),
+        options.spec_list.as_deref(),
+        options.ignore_spec,
+        options.create_blanks,
+        options.time_domain_mode,
+    )?;
+    let file_order = argsort(&spec_info.file_specs);
+    let chan_order = argsort(&spec_info.specs);
+    let specs: Vec<f64> = chan_order.iter().map(|&i| spec_info.specs[i]).collect();
+    let missing: Vec<bool> = chan_order.iter().map(|&i| spec_info.missing[i]).collect();
+
+    let mut sorted_inputs = file_order.iter().copied();
+    let mut inputs: Vec<Option<usize>> = missing
+        .iter()
+        .map(|&m| if m { None } else { sorted_inputs.next() })
+        .collect();
+    let placed = inputs.iter().flatten().count();
+    if placed != file_list.len() {
+        return Err(FitsCubeError::ChannelMissing(format!(
+            "{placed} channels have an input, but there are {} inputs",
+            file_list.len()
+        )));
+    }
+
+    let beams = match beams::input_beams(headers) {
+        None => None,
+        Some(per_input) => {
+            let sorted: Vec<Beam> = file_order.iter().map(|&i| per_input[i]).collect();
+            let beams = beams::expand_beams(&sorted, &missing)?;
+            Some(blank_zero_beams(
+                beams,
+                &mut inputs,
+                options.blank_zero_beams,
+            ))
+        }
+    };
+    Ok(Channels {
+        specs,
+        inputs,
+        beams,
+    })
+}
+
+/// Warn about channels with a zero beam and, if `blank`, make them NaN planes.
+fn blank_zero_beams(beams: Vec<Beam>, inputs: &mut [Option<usize>], blank: bool) -> Vec<Beam> {
+    let zero = beams::find_zero_beams(&beams);
+    let chans: Vec<usize> = (0..zero.len()).filter(|&c| zero[c]).collect();
+    if chans.is_empty() {
+        return beams;
+    }
+    let shown = match chans.len() {
+        n if n > 10 => format!("{:?} (and {} more)", &chans[..10], n - 10),
+        _ => format!("{chans:?}"),
+    };
+    if !blank {
+        tracing::warn!(
+            "Channels {shown} have a restoring beam of exactly zero, but \
+             blank_zero_beams is off, so they are being kept as-is."
+        );
+        return beams;
+    }
+    tracing::warn!(
+        "Channels {shown} have a restoring beam of exactly zero. These planes carry no \
+         real PSF (e.g. a wsclean model image from -fit-spectral-pol) and are being \
+         blanked with NaNs. Pass --no-blank-zero-beams (blank_zero_beams=False) to keep them."
+    );
+    for &c in &chans {
+        inputs[c] = None;
+    }
+    beams::nan_zero_beams(&beams, &zero)
+}
+
+/// The box to trim the planes to, if any.
+fn bounding_box(
+    file_list: &[PathBuf],
+    first: &InputHeader,
+    options: &CombineOptions,
+    pool: Option<&ThreadPool>,
+) -> Result<Option<BoundingBox>> {
+    if let Some(bb) = options.supplied_bounding_box {
+        let (ncols, nrows) = first.shape();
+        if bb.original_shape != (nrows, ncols) || bb.xmax > nrows || bb.ymax > ncols {
+            return Err(FitsCubeError::ShapeMismatch(format!(
+                "The supplied bounding box {bb:?} does not fit the input images, whose \
+                 planes have shape (NAXIS2, NAXIS1)={:?}",
+                (nrows, ncols)
+            )));
+        }
+        return Ok(Some(bb));
+    }
+    if !options.bounding_box {
+        return Ok(None);
+    }
+    let spin = options
+        .progress
+        .then(|| spinner("solving for common bounding box"));
+    let bb = in_pool(pool, || {
+        get_common_bounding_box(file_list, options.invalidate_zeros)
+    })?;
+    if let Some(spin) = spin {
+        spin.finish_and_clear();
+    }
+    Ok(Some(bb))
+}
+
+/// Indices that sort `keys` ascending (stable).
+fn argsort(keys: &[f64]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..keys.len()).collect();
+    idx.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
+    idx
 }
 
 fn median(values: &[f64]) -> f64 {
     let mut v = values.to_vec();
     v.sort_by(f64::total_cmp);
-    let n = v.len();
-    if n == 0 {
-        return f64::NAN;
-    }
-    if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        0.5 * (v[n / 2 - 1] + v[n / 2])
+    match v.len() {
+        0 => f64::NAN,
+        n if n % 2 == 1 => v[n / 2],
+        n => 0.5 * (v[n / 2 - 1] + v[n / 2]),
     }
 }
 
@@ -166,15 +362,7 @@ fn std_dev(values: &[f64]) -> f64 {
     var.sqrt()
 }
 
-/// `argsort`: indices that would sort `keys` ascending (stable).
-fn argsort(keys: &[f64]) -> Vec<usize> {
-    let mut idx: Vec<usize> = (0..keys.len()).collect();
-    idx.sort_by(|&a, &b| keys[a].total_cmp(&keys[b]));
-    idx
-}
-
-/// Decide whether the axis is evenly spaced enough to encode as a regular
-/// CDELT, mirroring the `even_spec` test in `create_output_cube`.
+/// Whether the axis is regular enough to describe with CRVAL and CDELT.
 fn is_evenly_spaced(specs: &[f64], time_domain_mode: bool) -> bool {
     if specs.len() < 2 {
         return true;
@@ -183,728 +371,300 @@ fn is_evenly_spaced(specs: &[f64], time_domain_mode: bool) -> bool {
     sorted.sort_by(f64::total_cmp);
     let diff: Vec<f64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
 
-    if time_domain_mode {
-        // Constrain the accumulated deviation of the second-order differences:
-        // small running total ⇒ close enough to regular spacing to encode.
-        if diff.len() < 2 {
-            return true;
-        }
-        let diff_diff: Vec<f64> = diff.windows(2).map(|w| w[1] - w[0]).collect();
-        let mut cumsum = 0.0;
-        let mut max_dev = 0.0_f64;
-        for d in &diff_diff {
-            cumsum += d;
-            max_dev = max_dev.max(cumsum.abs());
-        }
-        let mean_diff = diff.iter().sum::<f64>() / diff.len() as f64;
-        max_dev < mean_diff * 0.02
-    } else {
-        std_dev(&diff) < 1e-4
+    if !time_domain_mode {
+        return std_dev(&diff) < 1e-4;
     }
+    // ASKAP scan times jitter, so allow uneven steps whose deviations cancel
+    // out along the axis
+    let mut cumsum = 0.0;
+    let mut max_dev = 0.0_f64;
+    for w in diff.windows(2) {
+        cumsum += w[1] - w[0];
+        max_dev = max_dev.max(cumsum.abs());
+    }
+    let mean_diff = diff.iter().sum::<f64>() / diff.len() as f64;
+    diff.len() < 2 || max_dev < mean_diff * 0.02
 }
 
-/// Where the spectral/temporal axis lives in the output cube.
-struct AxisPlacement {
-    fits_idx: usize,
-}
-
-/// Result of initialising the output cube.
-struct InitResult {
-    /// BITPIX of the output data unit.
-    bitpix: i64,
-    /// Pixels in one output channel: the product of every axis below the
-    /// combine axis (NAXIS1 × NAXIS2 after any bounding-box trim, times any
-    /// Stokes or other axes of the inputs).
-    plane_len: usize,
-}
-
-/// Build the complete primary header for the output cube and return its on-disk
-/// byte layout ([`CubeLayout`]) — no data unit is written here (see
-/// [`crate::mem_header`]).
-#[allow(clippy::too_many_arguments)]
-fn create_output_cube(
-    template: &Path,
-    out_cube: &Path,
-    specs: &[f64],
+/// What the cube header is built from.
+struct CubeHeader<'a> {
+    template: &'a Path,
+    first: &'a InputHeader,
+    specs: &'a [f64],
     ignore_spec: bool,
-    has_beams: bool,
-    single_beam: bool,
-    overwrite: bool,
+    varying_beams: bool,
     time_domain_mode: bool,
-    bbox: Option<&BoundingBox>,
-    out_bitpix: i64,
-    storage: &Storage,
-) -> Result<(InitResult, CubeLayout)> {
-    if out_cube.exists() && !overwrite {
-        return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));
-    }
-
-    let unit = if time_domain_mode { "s" } else { "Hz" };
-    let ctype = if time_domain_mode { "TIME" } else { "FREQ" };
-
-    let geom = HeaderGeom::read(template)?;
-    let n_chan = specs.len();
-    let even_spec = is_evenly_spaced(specs, time_domain_mode);
-    if !even_spec {
-        tracing::warn!(
-            "{} are not evenly spaced; encoding axis as CHAN",
-            if time_domain_mode {
-                "Times"
-            } else {
-                "Frequencies"
-            }
-        );
-    }
-
-    // Locate the spectral axis (existing axis for a cube input, or a new one).
-    let placement = if geom.is_2d() {
-        AxisPlacement { fits_idx: 3 }
-    } else {
-        match find_target_axis(template, ctype) {
-            Ok(axis) => AxisPlacement {
-                fits_idx: axis.fits_idx,
-            },
-            Err(_) => AxisPlacement {
-                fits_idx: geom.naxis + 1,
-            },
-        }
-    };
-    let fi = placement.fits_idx;
-
-    // Output dimensions in FITS order (NAXIS1 fastest).
-    let mut dims = geom.dims.clone();
-    if geom.is_2d() {
-        dims.push(n_chan); // new NAXIS3
-    } else if fi <= dims.len() {
-        dims[fi - 1] = n_chan;
-    } else {
-        dims.resize(fi, 1);
-        dims[fi - 1] = n_chan;
-    }
-    if let Some(bb) = bbox {
-        // NAXIS1 (fast/cols) ← y-span, NAXIS2 (slow/rows) ← x-span.
-        dims[0] = bb.y_span;
-        dims[1] = bb.x_span;
-    }
-
-    // Planes are written at an offset of (plane bytes × channel), which only
-    // lands on the right plane when the combine axis is the slowest-varying one
-    // — i.e. every axis above it in the cube is degenerate.
-    let trailing: Vec<String> = dims
-        .iter()
-        .enumerate()
-        .skip(fi)
-        .filter(|&(_, &n)| n != 1)
-        .map(|(i, n)| format!("NAXIS{}={n}", i + 1))
-        .collect();
-    if !trailing.is_empty() {
-        return Err(FitsCubeError::AxisOrder(format!(
-            "The {ctype} axis (NAXIS{fi}) must be the slowest-varying axis of the \
-             output cube, but non-degenerate axes sit above it: {}. Reorder the axes \
-             of the input images before combining.",
-            trailing.join(", ")
-        )));
-    }
-
-    // Detect transform-matrix presence before we clobber anything.
-    let has_cd = has_key(template, "CD1_1")?;
-    let has_pc = has_key(template, "PC1_1")?;
-
-    // Build the header in memory (no disk, so cfitsio never zero-fills the data
-    // unit) at its final shape/BITPIX, copying the template's WCS cards. The
-    // caller writes the header bytes and streams planes with raw I/O, so the data
-    // unit is written exactly once and its untouched tail stays sparse — see
-    // [`crate::mem_header`] and [`write_cube_raw`].
-    // Build the header in memory (no disk, so cfitsio never zero-fills the data
-    // unit) at its final shape/BITPIX. `create_mem_cube` allocates size-1 dummy
-    // axes internally — `extract_header_layout` stamps the real NAXISn into the
-    // serialised header — so no cube-sized buffer is ever allocated in RAM.
-    let mut fptr = create_mem_cube(template, out_bitpix, &dims)?;
-
-    // Integer cubes copy the inputs' stored values (see
-    // [`process_plane_raw_int`]), so they keep the cards that decode them;
-    // float cubes hold decoded values and must not.
-    if out_bitpix > 0 {
-        if let Some(bscale) = storage.bscale {
-            update_key_f64(&mut fptr, "BSCALE", bscale)?;
-        }
-        if let Some(bzero) = storage.bzero {
-            update_key_f64(&mut fptr, "BZERO", bzero)?;
-        }
-        if let Some(blank) = storage.blank {
-            update_key_i64(&mut fptr, "BLANK", blank)?;
-        }
-    }
-
-    // Spectral/temporal axis cards.
-    update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
-    update_key_f64(&mut fptr, &format!("CRVAL{fi}"), specs[0])?;
-    let cdelt = if n_chan > 1 {
-        let diffs: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
-        median(&diffs)
-    } else {
-        1.0
-    };
-    update_key_f64(&mut fptr, &format!("CDELT{fi}"), cdelt)?;
-    update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
-    update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
-
-    // Diagonal transform term for the new axis, for consistency.
-    if (has_cd || has_pc) && fi != 1 {
-        let kind = if has_cd { "CD" } else { "PC" };
-        update_key_f64(&mut fptr, &format!("{kind}{fi}_{fi}"), 1.0)?;
-    }
-
-    // Unevenly spaced or ignored ⇒ encode a plain channel index.
-    if ignore_spec || !even_spec {
-        update_key_f64(&mut fptr, &format!("CDELT{fi}"), 1.0)?;
-        delete_key(&mut fptr, &format!("CUNIT{fi}"))?;
-        update_key_str(&mut fptr, &format!("CTYPE{fi}"), "CHAN")?;
-        update_key_f64(&mut fptr, &format!("CRVAL{fi}"), 1.0)?;
-    }
-
-    // Varying beams ⇒ drop the single-beam keywords; the BEAMS table holds
-    // the per-channel values.
-    if has_beams && !single_beam {
-        let tiny = f32::MIN_POSITIVE;
-        update_key_logical(&mut fptr, "CASAMBM", true)?;
-        write_comment(&mut fptr, "The PSF in each image plane varies.")?;
-        write_comment(
-            &mut fptr,
-            "Full beam information is stored in the second FITS extension.",
-        )?;
-        write_comment(
-            &mut fptr,
-            &format!("The value '{tiny}' represents a NaN PSF in the beamtable."),
-        )?;
-        delete_key(&mut fptr, "BMAJ")?;
-        delete_key(&mut fptr, "BMIN")?;
-        delete_key(&mut fptr, "BPA")?;
-    }
-
-    // Bounding box shifts the spatial reference pixel.
-    if let Some(bb) = bbox {
-        let hdu = fptr.primary_hdu()?;
-        let crpix1: f64 = hdu.read_key(&mut fptr, "CRPIX1").unwrap_or(1.0);
-        let crpix2: f64 = hdu.read_key(&mut fptr, "CRPIX2").unwrap_or(1.0);
-        update_key_f64(&mut fptr, "CRPIX1", crpix1 - bb.ymin as f64)?;
-        update_key_f64(&mut fptr, "CRPIX2", crpix2 - bb.xmin as f64)?;
-    }
-
-    let layout = extract_header_layout(&mut fptr, &dims)?;
-    Ok((
-        InitResult {
-            bitpix: out_bitpix,
-            plane_len: dims[..fi - 1].iter().product(),
-        },
-        layout,
-    ))
+    bbox: Option<&'a BoundingBox>,
+    bitpix: i64,
 }
 
-/// Slice every 2D plane of an input (rows xmin:xmax, cols ymin:ymax, matching
-/// numpy `[..., x, y]`) down to the bounding box.
-fn crop_to_box<T: Clone>(
-    flat: &[T],
-    nrows: usize,
-    ncols: usize,
-    bb: &BoundingBox,
-) -> Result<Vec<T>> {
-    let mut out = Vec::with_capacity(flat.len() / (nrows * ncols) * bb.x_span * bb.y_span);
-    for plane in flat.chunks(nrows * ncols) {
-        let view = ArrayView2::from_shape((nrows, ncols), plane)?;
-        let sub = view.slice(ndarray::s![bb.xmin..bb.xmax, bb.ymin..bb.ymax]);
-        out.extend(sub.iter().cloned());
-    }
-    Ok(out)
-}
-
-/// Pixel count and (NAXIS2, NAXIS1) of the open primary image.
-fn image_size(fptr: &mut FitsFile) -> Result<(usize, (usize, usize))> {
-    let hdu = fptr.primary_hdu()?;
-    match &hdu.info {
-        HduInfo::ImageInfo { shape, .. } if shape.len() >= 2 => {
-            let n = shape.iter().product();
-            Ok((n, (shape[shape.len() - 2], shape[shape.len() - 1])))
-        }
-        HduInfo::ImageInfo { shape, .. } => {
-            Err(FitsCubeError::UnsupportedNaxis(shape.len() as i64))
-        }
-        _ => Err(FitsCubeError::UnsupportedNaxis(0)),
-    }
-}
-
-/// Float pixel types a cube is written in.
-trait FloatPixel: num_traits::Float + BeBytes + Send + Sync + 'static {
-    /// cfitsio datatype code.
-    const DATATYPE: u32;
-}
-
-impl FloatPixel for f32 {
-    const DATATYPE: u32 = fitsio::sys::TFLOAT;
-}
-
-impl FloatPixel for f64 {
-    const DATATYPE: u32 = fitsio::sys::TDOUBLE;
-}
-
-/// Read all `n` pixels of the open primary image as `T`. Pixels equal to an
-/// integer image's BLANK come back as NaN.
-fn read_decoded<T: FloatPixel>(fptr: &mut FitsFile, n: usize) -> Result<Vec<T>> {
-    let mut out = vec![T::zero(); n];
-    let mut nulval = T::nan();
-    let mut anynul = 0;
-    let mut status = 0;
-    // SAFETY: `out` holds the `n` elements requested, and `nulval` has the
-    // type named by `T::DATATYPE`.
-    unsafe {
-        fitsio::sys::ffgpv(
-            fptr.as_raw(),
-            T::DATATYPE as _,
-            1,
-            n as _,
-            (&mut nulval as *mut T).cast(),
-            out.as_mut_ptr().cast(),
-            &mut anynul,
-            &mut status,
-        );
-    }
-    check_status(status)?;
-    Ok(out)
-}
-
-/// Read one input image as type `T`, apply bounding box / zero-invalidation, and
-/// return the flat (row-major) buffer of every plane in it.
-fn process_plane<T: FloatPixel>(
-    path: &Path,
-    bbox: Option<&BoundingBox>,
-    invalidate_zeros: bool,
-) -> Result<Vec<T>> {
-    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let (n, (nrows, ncols)) = image_size(&mut fptr)?;
-    let flat: Vec<T> = read_decoded(&mut fptr, n)?;
-    let mut plane: Vec<T> = match bbox {
-        Some(bb) => crop_to_box(&flat, nrows, ncols, bb)?,
-        None => flat,
-    };
-
-    if invalidate_zeros {
-        let zero = T::zero();
-        let nan = T::nan();
-        for v in &mut plane {
-            if *v == zero {
-                *v = nan;
-            }
-        }
-    }
-    Ok(plane)
-}
-
-/// Read one integer input image as its raw stored values (BSCALE/BZERO not
-/// applied), cropped to any bounding box.
-///
-/// The cube keeps the first input's BITPIX, BSCALE and BZERO, so copying the
-/// stored integers is lossless, where decoding through floats and re-encoding
-/// would not be.
-fn process_plane_raw_int(path: &Path, bbox: Option<&BoundingBox>) -> Result<Vec<i64>> {
-    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
-    let (n, (nrows, ncols)) = image_size(&mut fptr)?;
-    let mut flat = vec![0i64; n];
-    let mut anynul = 0;
-    let mut status = 0;
-    // SAFETY: `fptr` is an open image positioned on its primary HDU, and `flat`
-    // holds exactly the `n` elements requested.
-    unsafe {
-        fitsio::sys::ffpscl(fptr.as_raw(), 1.0, 0.0, &mut status);
-        fitsio::sys::ffgpvjj(
-            fptr.as_raw(),
-            0,
-            1,
-            n as _,
-            0,
-            flat.as_mut_ptr(),
-            &mut anynul,
-            &mut status,
-        );
-    }
-    check_status(status)?;
-    match bbox {
-        Some(bb) => crop_to_box(&flat, nrows, ncols, bb),
-        None => Ok(flat),
-    }
-}
-
-/// Serialise a plane to big-endian FITS bytes.
-fn encode_be<T: BeBytes>(data: &[T]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(data.len() * T::WIDTH);
-    for &v in data {
-        v.extend_be(&mut buf);
-    }
-    buf
-}
-
-/// Serialise raw integers to big-endian FITS bytes at the width of `bitpix`.
-fn encode_int_be(data: &[i64], bitpix: i64) -> Vec<u8> {
-    match bitpix {
-        8 => data.iter().map(|&v| v as u8).collect(),
-        16 => encode_be(&data.iter().map(|&v| v as i16).collect::<Vec<_>>()),
-        32 => encode_be(&data.iter().map(|&v| v as i32).collect::<Vec<_>>()),
-        _ => encode_be(data),
-    }
-}
-
-/// Stream all channels into the output cube using raw I/O.
-///
-/// Bypasses cfitsio for the data unit: the file is created with the prebuilt
-/// header ([`CubeLayout`]) and sparsely extended to its final length, then each
-/// channel's big-endian bytes from `encode_channel` are written at its offset.
-/// This mirrors the Python reference (`astype(">f4")` + raw `tofile`), which is
-/// markedly faster than cfitsio's per-block write path and never pays the
-/// zero-fill pass cfitsio does on close.
-///
-/// Channels are decoded and byte-swapped by the rayon pool (parallel readers)
-/// and written on this single thread; `write_all_at` is positional, so
-/// out-of-order arrival is fine.
-fn write_cube_raw(
-    out_cube: &Path,
-    layout: &CubeLayout,
-    n_chan: usize,
-    plane_bytes: u64,
-    encode_channel: impl Fn(usize) -> Result<Vec<u8>> + Sync,
-    pool: Option<&ThreadPool>,
-    progress: bool,
-) -> Result<()> {
-    // Lay down the header and size the file. `set_len` past the header leaves the
-    // data unit (and its 2880-padded tail) sparse — zero-backed on demand — so no
-    // zeros are physically written; the planes below cover the real data.
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(out_cube)?;
-    file.write_all_at(&layout.header, 0)?;
-    let data_len = plane_bytes * n_chan as u64;
-    file.set_len(layout.datastart + round_up_to_block(data_len))?;
-
-    // Buffer enough decoded planes that the parallel readers stay ahead of the
-    // single (serial) writer instead of blocking on a tiny queue.
-    let threads = pool.map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads);
-    let bound = threads * 2;
-    let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(bound);
-
-    std::thread::scope(|scope| -> Result<()> {
-        let encode_channel = &encode_channel;
-        let producer = scope.spawn(move || -> Result<()> {
-            let res = in_pool(pool, || {
-                (0..n_chan).into_par_iter().try_for_each(|new_chan| -> Result<()> {
-                    let bytes = encode_channel(new_chan)?;
-                    if bytes.len() as u64 != plane_bytes {
-                        return Err(FitsCubeError::Other(format!(
-                            "channel {new_chan} holds {} bytes, but the cube expects {plane_bytes}",
-                            bytes.len()
-                        )));
-                    }
-                    tx.send((new_chan, bytes))
-                        .map_err(|e| FitsCubeError::Other(format!("channel send failed: {e}")))?;
-                    Ok(())
-                })
-            });
-            drop(tx); // close the channel so the writer loop below ends
-            res
-        });
-
-        // Writer (this thread): write each channel at its offset.
-        let pb = progress.then(|| {
-            let bar = progress_bar(n_chan as u64);
-            bar.set_message("writing planes");
-            bar
-        });
-        for (chan, bytes) in rx {
-            let offset = layout.datastart + chan as u64 * plane_bytes;
-            file.write_all_at(&bytes, offset)?;
-            if let Some(bar) = &pb {
-                bar.inc(1);
-            }
-        }
-        if let Some(bar) = &pb {
-            bar.finish_with_message("planes written");
-        }
-
-        producer
-            .join()
-            .map_err(|_| FitsCubeError::Other("reader thread panicked".to_string()))?
-    })
-}
-
-/// Encode one float channel: the input plane in `T`, or NaNs for a blank one.
-fn encode_float_channel<T: FloatPixel>(
-    input: Option<&Path>,
-    plane_len: usize,
-    bbox: Option<&BoundingBox>,
-    invalidate_zeros: bool,
-) -> Result<Vec<u8>> {
-    Ok(match input {
-        Some(path) => encode_be(&process_plane::<T>(path, bbox, invalidate_zeros)?),
-        None => encode_be(&vec![T::nan(); plane_len]),
-    })
-}
-
-/// A missing file as an [`std::io::ErrorKind::NotFound`] error, which cfitsio
-/// would only report as "could not open the named file".
-pub(crate) fn check_exists(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("{} does not exist", path.display()),
-    )
-    .into())
-}
-
-/// Run `f` in `pool`, or in rayon's global pool when there is none.
-fn in_pool<R: Send>(pool: Option<&ThreadPool>, f: impl FnOnce() -> R + Send) -> R {
-    match pool {
-        Some(pool) => pool.install(f),
-        None => f(),
-    }
-}
-
-/// Combine `file_list` into the cube at `out_cube`. Returns the output-axis
-/// values (Hz for frequency mode, MJD seconds for time mode).
-pub fn combine_fits(
-    file_list: &[PathBuf],
-    out_cube: &Path,
-    options: &CombineOptions,
-) -> Result<Vec<f64>> {
-    if file_list.is_empty() {
-        return Err(FitsCubeError::Other("file_list is empty".to_string()));
-    }
-    let float_bitpix = float_length_to_bitpix(options.float_length)?;
-    for path in file_list {
-        check_exists(path)?;
-    }
-
-    // The cube's header comes from the first input, so every input must share
-    // its pixel grid, axes and Stokes parameter.
-    let pool = options
-        .max_workers
-        .map(|n| ThreadPoolBuilder::new().num_threads(n.max(1)).build())
-        .transpose()?;
-    let pool = pool.as_ref();
-
-    let input_axes = in_pool(pool, || read_inputs_axes(file_list))?;
-    check_matching_shapes(file_list, &input_axes)?;
-    check_matching_axes(file_list, &input_axes)?;
-    let storage = input_axes[0].storage;
-    let out_bitpix = float_bitpix.unwrap_or(storage.bitpix);
-    if out_bitpix > 0 {
-        check_matching_storage(file_list, &input_axes)?;
-    }
-
-    let spec_info = parse_specs(
-        file_list,
-        options.spec_file.as_deref(),
-        options.spec_list.as_deref(),
-        options.ignore_spec,
-        options.create_blanks,
-        options.time_domain_mode,
-    )?;
-
-    // Sort files by their per-file value; sort the output axis independently.
-    let old_sort = argsort(&spec_info.file_specs);
-    let sorted_files: Vec<PathBuf> = old_sort.iter().map(|&i| file_list[i].clone()).collect();
-
-    let new_sort = argsort(&spec_info.specs);
-    let specs: Vec<f64> = new_sort.iter().map(|&i| spec_info.specs[i]).collect();
-    let missing: Vec<bool> = new_sort.iter().map(|&i| spec_info.missing[i]).collect();
-
-    // Beams are parsed after sorting so that they follow the channel order of
-    // the output cube, not the order the files were given in. Any input with a
-    // beam counts, not just the first.
-    let has_beams = beams::check_for_any_beam(&sorted_files)?;
-    let mut zero_beam = vec![false; specs.len()];
-    let (beams_vec, single_beam): (Option<Vec<Beam>>, bool) = if has_beams {
-        let mut beams = beams::expand_beams(&beams::parse_beams(&sorted_files)?, &missing)?;
-        let found_zero_beams = beams::find_zero_beams(&beams);
-        if found_zero_beams.iter().any(|&z| z) {
-            // Keep the message readable when a whole run has zero beams
-            let all_zero_chans: Vec<usize> = found_zero_beams
-                .iter()
-                .enumerate()
-                .filter_map(|(chan, &z)| z.then_some(chan))
-                .collect();
-            let zero_chans = if all_zero_chans.len() > 10 {
-                format!(
-                    "{:?} (and {} more)",
-                    &all_zero_chans[..10],
-                    all_zero_chans.len() - 10
-                )
-            } else {
-                format!("{all_zero_chans:?}")
-            };
-            if options.blank_zero_beams {
-                tracing::warn!(
-                    "Channels {zero_chans} have a restoring beam of exactly zero. These \
-                     planes carry no real PSF (e.g. a wsclean model image from \
-                     -fit-spectral-pol) and are being blanked with NaNs. Pass \
-                     --no-blank-zero-beams (blank_zero_beams=False) to keep them."
-                );
-                beams = beams::nan_zero_beams(&beams, &found_zero_beams);
-                zero_beam = found_zero_beams;
-            } else {
-                tracing::warn!(
-                    "Channels {zero_chans} have a restoring beam of exactly zero, but \
-                     blank_zero_beams is off, so they are being kept as-is."
-                );
-            }
-        }
-        let single = beams::is_single_beam(&beams);
-        (Some(beams), single)
-    } else {
-        (None, false)
-    };
-
-    // Optional common bounding box. A caller supplied box is used as is, so that
-    // separate cubes can be forced onto a common pixel grid.
-    let final_bbox: Option<BoundingBox> = if let Some(bb) = options.supplied_bounding_box {
-        let (ncols, nrows) = input_axes[0].shape;
-        let grid = (nrows as usize, ncols as usize);
-        if bb.original_shape != grid || bb.xmax > grid.0 || bb.ymax > grid.1 {
-            return Err(FitsCubeError::ShapeMismatch(format!(
-                "The supplied bounding box {bb:?} does not fit the input images, whose \
-                 planes have shape (NAXIS2, NAXIS1)={grid:?}"
-            )));
-        }
-        Some(bb)
-    } else if options.bounding_box {
-        let spin = options
-            .progress
-            .then(|| spinner("solving for common bounding box"));
-        let bb = in_pool(pool, || {
-            get_common_bounding_box(&sorted_files, options.invalidate_zeros)
-        })?;
-        if let Some(spin) = spin {
-            spin.finish_and_clear();
-        }
-        Some(bb)
-    } else {
-        None
-    };
-    if let Some(bb) = &final_bbox {
-        tracing::info!("The final bounding box is: {bb:?}");
-    }
-
-    // Lay out the beam table's POL column before writing any data, so an
-    // unsupported cube (e.g. multi-Stokes) fails before the planes are copied
-    // in. Stokes is never the combine axis, so the cube keeps the inputs' one.
-    let stokes_idx = beams::get_polarisation(input_axes[0].stokes_codes.as_ref().map(Vec::len));
-    if has_beams && !single_beam {
-        beams::beam_table_pol(&stokes_idx)?;
-    }
-
-    // Build the output header (in memory) and its on-disk byte layout.
-    let (init, layout) = create_output_cube(
-        &sorted_files[0],
-        out_cube,
-        &specs,
-        options.ignore_spec,
-        has_beams,
-        single_beam,
-        options.overwrite,
-        options.time_domain_mode,
-        final_bbox.as_ref(),
-        out_bitpix,
-        &storage,
-    )?;
-
-    // Map each output channel to an input index (None ⇒ blank/missing plane).
-    let mut new_to_old: Vec<Option<usize>> = Vec::with_capacity(specs.len());
-    let mut next_old = 0usize;
-    for &is_missing in &missing {
-        if is_missing {
-            new_to_old.push(None);
+impl CubeHeader<'_> {
+    /// The header bytes, and the number of pixels in one channel.
+    fn build(&self) -> Result<(CubeLayout, usize)> {
+        let first = self.first;
+        let (ctype, unit) = if self.time_domain_mode {
+            ("TIME", "s")
         } else {
-            new_to_old.push(Some(next_old));
-            next_old += 1;
+            ("FREQ", "Hz")
+        };
+        let n_chan = self.specs.len();
+        let even_spec = is_evenly_spaced(self.specs, self.time_domain_mode);
+        if !even_spec {
+            tracing::warn!(
+                "{} are not evenly spaced; labelling the axis with channel numbers",
+                if self.time_domain_mode {
+                    "Times"
+                } else {
+                    "Frequencies"
+                }
+            );
         }
-    }
-    if next_old != sorted_files.len() {
-        return Err(FitsCubeError::ChannelMissing(format!(
-            "channel/file count mismatch: {} present channels for {} files",
-            next_old,
-            sorted_files.len()
-        )));
-    }
 
-    // Blank channels, zero-beam planes and invalidated zeros are all NaNs,
-    // which an integer cube cannot hold.
-    let blank_channels = missing.iter().zip(&zero_beam).any(|(&m, &z)| m || z);
-    if init.bitpix > 0 && (blank_channels || options.invalidate_zeros) {
-        return Err(FitsCubeError::Other(format!(
-            "Blank channels and invalidated zeros are written as NaNs, which integer \
-             output data (BITPIX={}) cannot hold. Pass float_length=32 or 64 (--floating).",
-            init.bitpix
-        )));
-    }
+        // 1-based FITS number of the combine axis
+        let fi = match first.ctypes.iter().position(|c| c.contains(ctype)) {
+            _ if first.is_2d() => 3,
+            Some(i) => i + 1,
+            None => first.dims.len() + 1,
+        };
+        let mut dims = first.dims.clone();
+        dims.resize(dims.len().max(fi), 1);
+        dims[fi - 1] = n_chan;
+        if let Some(bb) = self.bbox {
+            dims[0] = bb.y_span;
+            dims[1] = bb.x_span;
+        }
 
-    // Input image of each output channel; None ⇒ a blank (NaN) plane.
-    let inputs: Vec<Option<&Path>> = new_to_old
-        .iter()
-        .zip(&zero_beam)
-        .map(|(old, &z)| old.filter(|_| !z).map(|i| sorted_files[i].as_path()))
-        .collect();
-    let bbox = final_bbox.as_ref();
-    let plane_len = init.plane_len;
-    let width = (init.bitpix.unsigned_abs() / 8) as usize;
-    let plane_bytes = (plane_len * width) as u64;
-    let write = |encode: &(dyn Fn(usize) -> Result<Vec<u8>> + Sync)| {
-        write_cube_raw(
-            out_cube,
-            &layout,
-            inputs.len(),
-            plane_bytes,
-            encode,
-            pool,
-            options.progress,
-        )
-    };
-
-    // Stream planes in the output precision.
-    match init.bitpix {
-        -32 => write(&|chan| {
-            encode_float_channel::<f32>(inputs[chan], plane_len, bbox, options.invalidate_zeros)
-        })?,
-        -64 => write(&|chan| {
-            encode_float_channel::<f64>(inputs[chan], plane_len, bbox, options.invalidate_zeros)
-        })?,
-        8 | 16 | 32 | 64 => write(&|chan| {
-            // Integer cubes never have blank channels (checked above)
-            let path = inputs[chan].ok_or_else(|| {
-                FitsCubeError::ChannelMissing(format!("no input for channel {chan}"))
-            })?;
-            Ok(encode_int_be(
-                &process_plane_raw_int(path, bbox)?,
-                init.bitpix,
-            ))
-        })?,
-        other => {
-            return Err(FitsCubeError::Other(format!(
-                "unsupported output BITPIX={other}"
+        // Planes go in at (channel x plane size), so every axis above the
+        // combine axis must have length 1
+        let trailing: Vec<String> = dims
+            .iter()
+            .enumerate()
+            .skip(fi)
+            .filter(|&(_, &n)| n != 1)
+            .map(|(i, n)| format!("NAXIS{}={n}", i + 1))
+            .collect();
+        if !trailing.is_empty() {
+            return Err(FitsCubeError::AxisOrder(format!(
+                "The {ctype} axis (NAXIS{fi}) must be the slowest-varying axis of the \
+                 output cube, but non-degenerate axes sit above it: {}. Reorder the axes \
+                 of the input images before combining.",
+                trailing.join(", ")
             )));
         }
+
+        let mut fptr = create_mem_cube(self.template, self.bitpix, &dims)?;
+        let as_channels = self.ignore_spec || !even_spec;
+        let (crval, cdelt) = if as_channels {
+            (1.0, 1.0)
+        } else if n_chan > 1 {
+            let diffs: Vec<f64> = self.specs.windows(2).map(|w| w[1] - w[0]).collect();
+            (self.specs[0], median(&diffs))
+        } else {
+            (self.specs[0], 1.0)
+        };
+        update_key_i64(&mut fptr, &format!("CRPIX{fi}"), 1)?;
+        update_key_f64(&mut fptr, &format!("CRVAL{fi}"), crval)?;
+        update_key_f64(&mut fptr, &format!("CDELT{fi}"), cdelt)?;
+        if as_channels {
+            delete_key(&mut fptr, &format!("CUNIT{fi}"))?;
+            update_key_str(&mut fptr, &format!("CTYPE{fi}"), "CHAN")?;
+        } else {
+            update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
+            update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
+        }
+        if (first.has_cd || first.has_pc) && fi != 1 {
+            let kind = if first.has_cd { "CD" } else { "PC" };
+            update_key_f64(&mut fptr, &format!("{kind}{fi}_{fi}"), 1.0)?;
+        }
+
+        if self.varying_beams {
+            update_key_logical(&mut fptr, "CASAMBM", true)?;
+            write_comment(&mut fptr, "The PSF in each image plane varies.")?;
+            write_comment(
+                &mut fptr,
+                "Full beam information is stored in the second FITS extension.",
+            )?;
+            write_comment(
+                &mut fptr,
+                &format!(
+                    "The value '{}' represents a NaN PSF in the beamtable.",
+                    f32::MIN_POSITIVE
+                ),
+            )?;
+            for key in ["BMAJ", "BMIN", "BPA"] {
+                delete_key(&mut fptr, key)?;
+            }
+        }
+
+        if let Some(bb) = self.bbox {
+            let crpix1 = key_f64(&mut fptr, "CRPIX1")?.unwrap_or(0.0);
+            let crpix2 = key_f64(&mut fptr, "CRPIX2")?.unwrap_or(0.0);
+            update_key_f64(&mut fptr, "CRPIX1", crpix1 - bb.ymin as f64)?;
+            update_key_f64(&mut fptr, "CRPIX2", crpix2 - bb.xmin as f64)?;
+        }
+
+        let layout = extract_header_layout(&mut fptr, &dims)?;
+        Ok((layout, dims[..fi - 1].iter().product()))
+    }
+}
+
+/// Reads the image behind each channel.
+struct PlaneSource<'a> {
+    files: &'a [PathBuf],
+    headers: &'a [InputHeader],
+    inputs: &'a [Option<usize>],
+    bbox: Option<&'a BoundingBox>,
+    invalidate_zeros: bool,
+    plane_len: usize,
+}
+
+impl PlaneSource<'_> {
+    fn open(&self, i: usize) -> Result<FitsFile> {
+        let mut fptr = FitsFile::open(&self.files[i])?;
+        fptr.primary_hdu()?;
+        Ok(fptr)
     }
 
-    // Append the per-channel beam table when beams vary.
-    if has_beams
-        && !single_beam
-        && let Some(beams) = beams_vec
-    {
-        let mut fptr = FitsFile::edit(out_cube.to_string_lossy().as_ref())?;
-        beams::write_beam_table(&mut fptr, &beams, &stokes_idx)?;
+    fn ranges(&self, i: usize) -> Option<Vec<(usize, usize)>> {
+        self.bbox.map(|bb| bbox_ranges(&self.headers[i].dims, bb))
     }
 
-    Ok(specs)
+    /// Channel `chan` decoded to `T`, with BLANK pixels and blank channels NaN.
+    fn read_float<T: Pixel + Float>(&self, chan: usize, buf: &mut Vec<T>) -> Result<()> {
+        let Some(i) = self.inputs[chan] else {
+            buf.clear();
+            buf.resize(self.plane_len, T::nan());
+            return Ok(());
+        };
+        let mut fptr = self.open(i)?;
+        let header = &self.headers[i];
+        // Only integer images need BLANK mapped; NaN checks slow float reads
+        let s = header.storage;
+        let nulval = (s.bitpix > 0 && s.blank.is_some()).then(T::nan);
+        read_pixels(
+            &mut fptr,
+            &header.dims,
+            self.ranges(i).as_deref(),
+            nulval,
+            buf,
+        )?;
+        if self.invalidate_zeros {
+            for v in buf.iter_mut().filter(|v| v.is_zero()) {
+                *v = T::nan();
+            }
+        }
+        Ok(())
+    }
+
+    /// Channel `chan` as stored, without BSCALE/BZERO applied.
+    fn read_raw<T: Pixel>(&self, chan: usize, buf: &mut Vec<T>) -> Result<()> {
+        let i = self.inputs[chan]
+            .ok_or_else(|| FitsCubeError::ChannelMissing(format!("no input for channel {chan}")))?;
+        let mut fptr = self.open(i)?;
+        disable_scaling(&mut fptr)?;
+        let dims = &self.headers[i].dims;
+        read_pixels(&mut fptr, dims, self.ranges(i).as_deref(), None, buf)
+    }
+}
+
+/// Writes the header and the planes of a cube to `file`.
+struct CubeWriter<'a> {
+    file: &'a File,
+    layout: &'a CubeLayout,
+    n_chan: usize,
+    plane_len: usize,
+    pool: Option<&'a ThreadPool>,
+    progress: bool,
+}
+
+impl CubeWriter<'_> {
+    /// Write each channel `c` as filled into a buffer by `read_plane(c, buf)`.
+    fn write<T: Pixel>(
+        &self,
+        read_plane: impl Fn(usize, &mut Vec<T>) -> Result<()> + Sync,
+    ) -> Result<()> {
+        let plane_bytes = (self.plane_len * size_of::<T>()) as u64;
+        let data_len = plane_bytes * self.n_chan as u64;
+        write_at(self.file, &self.layout.header, 0)?;
+        // Size the file without writing the data unit; the OS backs the gap
+        // with zeros until the planes land
+        self.file
+            .set_len(self.layout.datastart + data_len.div_ceil(FITS_BLOCK) * FITS_BLOCK)?;
+
+        let threads = self
+            .pool
+            .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads);
+        let (tx, rx) = sync_channel::<(usize, Vec<T>)>(threads * 2);
+        // Written buffers go back to the readers
+        let spare: Mutex<Vec<Vec<T>>> = Mutex::new(Vec::new());
+
+        std::thread::scope(|scope| -> Result<()> {
+            let read_plane = &read_plane;
+            let spare = &spare;
+            let producer = scope.spawn(move || -> Result<()> {
+                let res = in_pool(self.pool, || {
+                    (0..self.n_chan).into_par_iter().try_for_each(|chan| {
+                        let mut buf = spare
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pop()
+                            .unwrap_or_default();
+                        read_plane(chan, &mut buf)?;
+                        if buf.len() != self.plane_len {
+                            return Err(FitsCubeError::ShapeMismatch(format!(
+                                "channel {chan} has {} pixels, but the cube expects {}",
+                                buf.len(),
+                                self.plane_len
+                            )));
+                        }
+                        swap_to_be(&mut buf);
+                        tx.send((chan, buf)).map_err(|_| FitsCubeError::Cancelled)
+                    })
+                });
+                drop(tx);
+                res
+            });
+
+            let pb = self.progress.then(|| {
+                let bar = progress_bar(self.n_chan as u64);
+                bar.set_message("writing planes");
+                bar
+            });
+            for (chan, buf) in rx {
+                let offset = self.layout.datastart + chan as u64 * plane_bytes;
+                write_at(self.file, as_bytes(&buf), offset)?;
+                spare.lock().unwrap_or_else(|e| e.into_inner()).push(buf);
+                if let Some(bar) = &pb {
+                    bar.inc(1);
+                }
+            }
+            if let Some(bar) = &pb {
+                bar.finish_with_message("planes written");
+            }
+            producer.join().map_err(|_| FitsCubeError::WorkerPanic)?
+        })
+    }
+}
+
+#[cfg(unix)]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset)? {
+            0 => return Err(std::io::ErrorKind::WriteZero.into()),
+            n => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

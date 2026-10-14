@@ -1,6 +1,6 @@
 //! End-to-end combines of image pairs across input axis layouts.
 //!
-//! Port of `tests/test_combine_layouts.py` in fitscube. Each case combines two
+//! Cases from fitscube's test_combine_layouts.py. Each case combines two
 //! single-plane images and states the cube it expects in the notation
 //! `(RA, DEC, FREQ) + (RA, DEC, FREQ) -> (RA, DEC, FREQ)`, or the error it
 //! expects. Axes are named by CTYPE. A Stokes symbol (e.g. `I` or `XX`) is a

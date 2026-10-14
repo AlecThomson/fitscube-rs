@@ -1,137 +1,118 @@
-//! Error types for fitscube-rs.
-//!
-//! Mirrors the exception hierarchy of the original `fitscube` Python package
-//! ([`fitscube.exceptions`](https://github.com/AlecThomson/fitscube)): a base
-//! [`FitsCubeError`] with dedicated variants for a missing target (FREQ/TIME)
-//! axis and an inaccessible channel, plus the I/O and parsing errors that arise
-//! in the Rust implementation.
+//! Error type. Variants named after a `fitscube.exceptions` class are raised
+//! as that class by the Python bindings.
 use std::path::PathBuf;
 
 use thiserror::Error;
 
-/// Top-level error for all fitscube-rs operations.
-///
-/// `TargetAxisMissing` and `ChannelMissing` correspond to the Python
-/// `TargetAxisMissingException` and `ChannelMissingException`.
 #[derive(Debug, Error)]
 pub enum FitsCubeError {
-    /// Underlying cfitsio error.
     #[error("FITS I/O error: {0}")]
     Fits(#[from] fitsio::errors::Error),
 
-    /// The worker thread pool could not be started.
-    #[error("thread pool: {0}")]
-    ThreadPool(#[from] rayon::ThreadPoolBuildError),
-
-    /// Filesystem I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// ndarray shape mismatch when reshaping a flat plane buffer.
-    #[error("shape error: {0}")]
-    Shape(#[from] ndarray::ShapeError),
+    #[error("thread pool: {0}")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
 
-    /// A required header keyword was absent.
+    /// Error from an atfits-rs helper with no closer match here.
+    #[error("{0}")]
+    Atfits(String),
+
     #[error("missing header keyword: {0}")]
     MissingKeyword(String),
 
-    /// The FREQ/TIME (or other requested) axis was not found in the WCS.
-    ///
-    /// Equivalent to Python `TargetAxisMissingException`.
+    /// `TargetAxisMissingException`
     #[error("target axis missing: {0}")]
     TargetAxisMissing(String),
 
-    /// A requested channel/timestep could not be accessed.
-    ///
-    /// Equivalent to Python `ChannelMissingException`.
+    /// `ChannelMissingException`
     #[error("channel missing: {0}")]
     ChannelMissing(String),
 
-    /// Input images do not share a common pixel grid.
-    ///
-    /// Equivalent to Python `ShapeMismatchException`.
+    /// `ShapeMismatchException`
     #[error("shape mismatch: {0}")]
     ShapeMismatch(String),
 
-    /// Input images do not share the same axes, in the same order.
-    ///
-    /// Equivalent to Python `AxisMismatchException`.
+    /// `AxisMismatchException`
     #[error("axis mismatch: {0}")]
     AxisMismatch(String),
 
-    /// Input images do not share the same Stokes parameter.
-    ///
-    /// Equivalent to Python `StokesMismatchException`.
+    /// `StokesMismatchException`
     #[error("Stokes mismatch: {0}")]
     StokesMismatch(String),
 
-    /// Integer inputs differ in BITPIX, BSCALE, BZERO or BLANK, so their stored
-    /// values cannot share one integer cube.
-    #[error("scaling mismatch: {0}")]
-    ScalingMismatch(String),
-
-    /// The combine axis is not the slowest-varying axis of the cube.
-    ///
-    /// Equivalent to Python `AxisOrderException`.
+    /// `AxisOrderException`
     #[error("axis order: {0}")]
     AxisOrder(String),
 
-    /// A regular grid through the inputs would drop some of them.
-    ///
-    /// Equivalent to Python `IrregularSpacingException`.
+    /// `IrregularSpacingException`
     #[error("irregular spacing: {0}")]
     IrregularSpacing(String),
 
-    /// A valid input the port does not support yet (e.g. multi-Stokes beams).
-    ///
-    /// Equivalent to Python `NotImplementedError`.
+    /// Integer inputs differ in BITPIX, BSCALE, BZERO or BLANK.
+    #[error("scaling mismatch: {0}")]
+    ScalingMismatch(String),
+
+    /// Python `NotImplementedError`
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
-    /// The output file already exists and `overwrite` was not set.
+    /// Python `FileExistsError`
     #[error("output file {0} already exists (use overwrite)")]
     OutputExists(PathBuf),
 
-    /// The output path is the input file.
     #[error("output {0} is the input file")]
     OutputIsInput(PathBuf),
 
-    /// Mutually exclusive spectral-input options were combined, or a count
-    /// mismatch was detected.
     #[error("invalid spectral input: {0}")]
     InvalidSpec(String),
 
-    /// A FITS image had an unexpected dimensionality.
+    #[error("float_length={0} is not a FITS float width; use 32 or 64")]
+    InvalidFloatLength(u8),
+
+    #[error("no input images given")]
+    NoInputs,
+
+    #[error(
+        "blank channels and invalidated zeros are written as NaN, which integer output \
+         (BITPIX={0}) cannot hold; pass float_length=32 or 64 (--floating)"
+    )]
+    BlanksNeedFloat(i64),
+
+    #[error("no input image has any finite pixels to bound")]
+    NoValidData,
+
+    #[error("unsupported BITPIX={0}")]
+    UnsupportedBitpix(i64),
+
     #[error("unsupported NAXIS={0}")]
     UnsupportedNaxis(i64),
 
-    /// Failed to parse a DATE-OBS timestamp.
     #[error("could not parse DATE-OBS {value:?}: {msg}")]
     TimeParse { value: String, msg: String },
 
-    /// Catch-all for invariant violations.
-    #[error("{0}")]
-    Other(String),
+    #[error("a worker thread panicked")]
+    WorkerPanic,
+
+    /// The plane writer stopped, so the readers gave up. The writer's own
+    /// error is the one returned.
+    #[error("cancelled after another error")]
+    Cancelled,
 }
 
-/// Map the shared [`atfits_rs::AtfitsError`] into the fitscube-rs hierarchy.
-///
-/// The low-level cfitsio helpers (keyword editing, image creation, axis lookup)
-/// live in `atfits-rs`; this lets a `?` on any of them flow into a
-/// [`FitsCubeError`] with the matching variant.
 impl From<atfits_rs::AtfitsError> for FitsCubeError {
     fn from(e: atfits_rs::AtfitsError) -> Self {
         use atfits_rs::AtfitsError as A;
         match e {
-            A::Fits(e) => FitsCubeError::Fits(e),
-            A::Io(e) => FitsCubeError::Io(e),
-            A::MissingKeyword(s) => FitsCubeError::MissingKeyword(s),
-            A::TargetAxisMissing(s) => FitsCubeError::TargetAxisMissing(s),
-            A::UnsupportedNaxis(n) => FitsCubeError::UnsupportedNaxis(n),
-            A::Other(s) => FitsCubeError::Other(s),
+            A::Fits(e) => Self::Fits(e),
+            A::Io(e) => Self::Io(e),
+            A::MissingKeyword(s) => Self::MissingKeyword(s),
+            A::TargetAxisMissing(s) => Self::TargetAxisMissing(s),
+            A::UnsupportedNaxis(n) => Self::UnsupportedNaxis(n),
+            A::Other(s) => Self::Atfits(s),
         }
     }
 }
 
-/// Convenience result alias.
 pub type Result<T> = std::result::Result<T, FitsCubeError>;

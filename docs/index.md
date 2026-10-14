@@ -17,7 +17,7 @@ performance.md
 ## Rust API
 
 The Rust crate is documented separately on
-[docs.rs/fitscube-rs](https://docs.rs/fitscube-rs) — the Python API on this
+[docs.rs/fitscube-rs](https://docs.rs/fitscube-rs). The Python API on this
 site is a thin binding over it.
 
 ## Indices and tables

@@ -1,15 +1,13 @@
-//! Regression tests for the cube-scrambling, blank-channel and beam bugs.
-//!
-//! Port of `tests/test_combine_guards.py`, `tests/test_zero_beams.py` and the
-//! beam tests of `tests/test_combine.py` in fitscube.
+//! Input checks, blank channels, beams and CLI behaviour. Many cases come from
+//! fitscube's test_combine_guards.py, test_zero_beams.py and test_combine.py.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use atfits_rs::{delete_key, update_key_f64, update_key_i64, update_key_str};
 use fitscube_rs::bounding_box::{BoundingBox, get_common_bounding_box};
-use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
+use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_input_headers};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_i64, update_key_str};
 use fitscube_rs::specs::read_spec_from_header;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
@@ -224,7 +222,7 @@ fn mismatched_shapes_raise() {
 fn check_matching_shapes_returns_grid() {
     let dir = tempfile::tempdir().unwrap();
     let files = file_list(dir.path());
-    let axes = read_inputs_axes(&files).unwrap();
+    let axes = read_input_headers(&files).unwrap();
     assert_eq!(check_matching_shapes(&files, &axes).unwrap(), (8, 8));
 }
 
@@ -235,7 +233,7 @@ fn check_matching_axes_accepts_common_stokes() {
     for path in &files {
         set_key(path, "CRVAL3", 3.0); // Stokes U
     }
-    check_matching_axes(&files, &read_inputs_axes(&files).unwrap()).unwrap();
+    check_matching_axes(&files, &read_input_headers(&files).unwrap()).unwrap();
 }
 
 /// CRVAL3=2 at CRPIX3=2 is still Stokes I at the (only) first pixel
@@ -245,7 +243,7 @@ fn check_matching_axes_compares_stokes_codes_not_keywords() {
     let files = file_list(dir.path());
     set_key(&files[3], "CRVAL3", 2.0);
     set_key(&files[3], "CRPIX3", 2.0);
-    check_matching_axes(&files, &read_inputs_axes(&files).unwrap()).unwrap();
+    check_matching_axes(&files, &read_input_headers(&files).unwrap()).unwrap();
 }
 
 /// A Q plane among I planes would be mislabelled as I in the cube
@@ -871,6 +869,18 @@ fn scaled_integer_input_is_copied_losslessly() {
         let physical = 32768.0 + 2.0 * (chan as f64 * 1000.0 - 30000.0);
         assert!(all_eq(plane, physical), "channel {chan}: {:?}", &plane[..2]);
     }
+
+    // Extracting copies the stored integers too
+    let opts = fitscube_rs::ExtractOptions {
+        channel_index: Some(2),
+        ..Default::default()
+    };
+    let plane = fitscube_rs::extract_plane_from_cube(&out_cube, &opts).unwrap();
+    assert_eq!(read_i64(&plane, "BITPIX"), 16);
+    assert!(all_eq(
+        &read_planes(&plane)[0],
+        32768.0 + 2.0 * (2000.0 - 30000.0)
+    ));
 }
 
 fn edit(path: &Path, f: impl FnOnce(&mut FitsFile)) {
@@ -1057,4 +1067,39 @@ fn cli_keeps_specs_file() {
             .count(),
         4
     );
+}
+
+/// A read failure part way through leaves the old output and no partial file.
+#[test]
+fn failed_combine_leaves_no_partial_cube() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    std::fs::write(&out_cube, "old").unwrap();
+    // Cut the data unit of the third input short
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&files[2])
+        .unwrap();
+    f.set_len(2880 + 100).unwrap();
+    drop(f);
+    combine_fits(&files, &out_cube, &options()).unwrap_err();
+    assert_eq!(std::fs::read_to_string(&out_cube).unwrap(), "old");
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".part"))
+        .collect();
+    assert!(names.is_empty(), "{names:?}");
+}
+
+#[test]
+fn cli_compress() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    fitscubers(&files, &out_cube, &["--compress"]);
+    assert!(!out_cube.exists());
+    assert_eq!(read_planes(&dir.path().join("cube.fits.gz")).len(), 4);
+    assert!(dir.path().join("cube.specs_Hz.txt").exists());
 }

@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::time::Instant;
 
-use fitscube_rs::fits_io::{CubeElem, create_cube_open};
+use atfits_rs::{CubeElem, create_cube_open};
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 
@@ -84,7 +84,7 @@ fn main() {
     }
     println!("WRITE raw seek+swap+write   : {:?}", t.elapsed());
 
-    // ── READ A: cfitsio read_image, open-per-plane (matches process_plane) ──
+    // ── READ A: cfitsio read_image, open-per-plane (as the combine readers did) ──
     let t = Instant::now();
     let mut sink = 0.0f32;
     for _ in 0..NCHAN {

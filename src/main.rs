@@ -1,8 +1,4 @@
-//! `fitscubers` command-line interface.
-//!
-//! Two subcommands mirror the original package:
-//! * `fitscubers combine` — combine single-plane images into a cube.
-//! * `fitscubers extract` — extract one plane from a cube.
+//! The `fitscubers` CLI: `combine` images into a cube, or `extract` a plane.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -77,6 +73,9 @@ struct CombineArgs {
     /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
     #[arg(long)]
     no_blank_zero_beams: bool,
+    /// Gzip the cube to OUT_CUBE.gz once it is written.
+    #[arg(long)]
+    compress: bool,
 }
 
 #[derive(Args)]
@@ -154,16 +153,19 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         invalidate_zeros: args.invalidate_zeros,
         float_length: args.floating,
         blank_zero_beams: !args.no_blank_zero_beams,
-        // CLI: show progress bars on stderr.
         progress: true,
     };
 
     let specs = combine_fits(&args.file_list, &args.out_cube, &options)
         .context("combining FITS files into a cube")?;
 
-    info!("Written cube to {}", args.out_cube.display());
+    let out_cube = if args.compress {
+        fitscube_rs::compress::compress_cube(&args.out_cube).context("compressing the cube")?
+    } else {
+        args.out_cube.clone()
+    };
+    info!("Written cube to {}", out_cube.display());
 
-    // Write the axis values alongside the cube, as the original CLI does.
     let body: String = specs.iter().map(|v| format!("{v}\n")).collect::<String>();
     std::fs::write(&specs_file, body)
         .with_context(|| format!("writing spec values to {}", specs_file.display()))?;

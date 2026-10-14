@@ -11,7 +11,7 @@
 
 <!-- SPHINX-START -->
 
-A Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube) Python package. Combines single-frequency/single-time FITS images into a FITS cube — building the spectral (or time) axis from the per-image headers, detecting even vs uneven spacing, preserving per-channel beams in a CASA `BEAMS` table — and extracts individual planes back out.
+A Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube) Python package. It stacks single-frequency or single-time FITS images into a cube, taking the frequency or time axis from the image headers and keeping per-channel beams in a CASA `BEAMS` table, and extracts planes back out of a cube.
 
 > **Note:** This is an experiment in LLM-assisted coding with Claude. Do not trust this software as far as you can throw it.
 
@@ -25,7 +25,7 @@ pip install fitscube-rs
 
 ### CLI binary
 
-Requires [Rust](https://rustup.rs/) 1.85+.
+Requires [Rust](https://rustup.rs/) 1.88+.
 
 ```sh
 cargo install fitscube-rs
@@ -57,19 +57,17 @@ uv run maturin develop --features stubgen
 uv run --no-sync python -c "from fitscube_rs._fitscube_rs import _generate_stubs; _generate_stubs()"
 ```
 
-This overwrites `fitscube_rs/_fitscube_rs.pyi` from the Rust annotations and docstrings. Commit the result alongside any API changes.
+This rewrites `fitscube_rs/_fitscube_rs/__init__.pyi` from the Rust signatures and docstrings. Commit it with the API change.
 
 ### Running tests
 
-**Python** tests need the compiled extension and the `test` extra (`pytest`,
-`astropy`), plus the upstream [`fitscube`](https://github.com/AlecThomson/fitscube)
-package, which the parity tests validate against. `uv sync` builds the maturin
-extension into `.venv`, so a plain `uvx pytest` won't work — it runs in an
-isolated env with neither the module nor the deps:
+**Python** tests need the compiled extension and the `test` extra, which
+includes [`fitscube`](https://github.com/AlecThomson/fitscube) for the parity
+tests. `uv sync` builds the extension into `.venv`; `uvx pytest` would run
+without it.
 
 ```sh
-uv sync --extra test       # builds the extension + installs test deps
-uv pip install fitscube    # upstream package, for parity tests
+uv sync --extra test --reinstall-package fitscube-rs   # rebuild after Rust changes
 uv run --no-sync pytest
 ```
 
@@ -81,11 +79,9 @@ cargo test
 
 ### Pre-commit hooks
 
-Formatters and linters run via [prek](https://github.com/j178/prek), a fast
-drop-in [pre-commit](https://pre-commit.com) reimplementation. The hooks
-(`.pre-commit-config.yaml`) are the same checks CI enforces: `ruff` lint +
-format, [`ty`](https://github.com/astral-sh/ty) type checking, `cargo fmt`, and
-`cargo clippy`.
+[prek](https://github.com/j178/prek) runs the hooks in
+`.pre-commit-config.yaml`, the same checks as CI: `ruff`, [`ty`](https://github.com/astral-sh/ty),
+`cargo fmt` and `cargo clippy`.
 
 ```sh
 uv sync --extra dev   # installs prek + ty into the venv

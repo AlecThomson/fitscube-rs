@@ -1,81 +1,23 @@
-//! Spectral/temporal axis parsing ("spequency" = frequency *or* time).
-//!
-//! Port of the metadata-parsing half of `fitscube.combine_fits`: pull a
-//! frequency (Hz) or time (MJD seconds) value out of each input image, optionally
-//! synthesise an evenly-spaced axis with gaps flagged as missing channels.
-use std::path::Path;
+//! The frequency or time axis of the cube ("spequency" covers both).
+use std::path::{Path, PathBuf};
 
-use fitsio::FitsFile;
 use hifitime::Epoch;
 
+use crate::checks::InputHeader;
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::{HeaderGeom, read_key_f64, read_key_string};
-use crate::keys::read_opt_key;
 
-/// Result of parsing the spectral/temporal axis.
+/// The axis values of the inputs and of the cube.
 #[derive(Debug, Clone)]
 pub struct SpecInfo {
-    /// One value per input file (Hz or s), used to sort the files.
+    /// One value per input (Hz or s), in input order.
     pub file_specs: Vec<f64>,
-    /// Output-axis values (Hz or s); longer than `file_specs` when blanks are
-    /// interpolated.
+    /// One value per cube channel. Longer than `file_specs` with blanks.
     pub specs: Vec<f64>,
-    /// `true` for each output channel that has no backing file (a blank plane).
+    /// Channels with no input, written as NaN.
     pub missing: Vec<bool>,
 }
 
-/// Factor that scales a frequency axis in `cunit` to Hz. An absent CUNIT means
-/// Hz (FITS WCS paper III).
-fn freq_unit_to_hz(cunit: Option<&str>) -> Result<f64> {
-    let unit = cunit.map(str::trim).unwrap_or("");
-    match unit.to_ascii_uppercase().as_str() {
-        "" | "HZ" => Ok(1.0),
-        "KHZ" => Ok(1e3),
-        "MHZ" => Ok(1e6),
-        "GHZ" => Ok(1e9),
-        _ => Err(FitsCubeError::InvalidSpec(format!(
-            "unknown frequency unit CUNIT={unit:?}; expected Hz, kHz, MHz or GHz"
-        ))),
-    }
-}
-
-/// Frequency (Hz) of the first pixel along the FREQ axis of `path`.
-///
-/// Missing cards take their FITS defaults (CRPIX 0, CRVAL 0, CDELT 1, PC 1).
-/// A CDi_i card replaces CDELTi * PCi_i. Off-diagonal terms are ignored.
-fn freq_at_first_pixel(path: &Path) -> Result<f64> {
-    let mut fptr = FitsFile::open(path)?;
-    let hdu = fptr.primary_hdu()?;
-    let naxis: i64 = hdu.read_key(&mut fptr, "NAXIS")?;
-    for i in 1..=naxis {
-        let ctype: Option<String> = read_opt_key(&hdu, &mut fptr, &format!("CTYPE{i}"))?;
-        if !ctype.is_some_and(|c| c.contains("FREQ")) {
-            continue;
-        }
-        let mut key = |name: String| read_opt_key::<f64>(&hdu, &mut fptr, &name);
-        let crval = key(format!("CRVAL{i}"))?.unwrap_or(0.0);
-        let crpix = key(format!("CRPIX{i}"))?.unwrap_or(0.0);
-        let step = match key(format!("CD{i}_{i}"))? {
-            Some(cd) => cd,
-            None => {
-                key(format!("CDELT{i}"))?.unwrap_or(1.0) * key(format!("PC{i}_{i}"))?.unwrap_or(1.0)
-            }
-        };
-        let cunit: Option<String> = read_opt_key(&hdu, &mut fptr, &format!("CUNIT{i}"))?;
-        let scale = freq_unit_to_hz(cunit.as_deref())
-            .map_err(|e| FitsCubeError::InvalidSpec(format!("{}: {e}", path.display())))?;
-        return Ok((crval + (1.0 - crpix) * step) * scale);
-    }
-    Err(FitsCubeError::TargetAxisMissing(format!(
-        "No FREQ axis found in WCS of {}. Cannot combine N-D images without \
-         frequency information.",
-        path.display()
-    )))
-}
-
-/// Convert an ISO-8601 (`isot`) DATE-OBS timestamp to MJD seconds.
-///
-/// Matches `Time(utc_time, format="isot").mjd * 86400` from the original.
+/// ISO-8601 DATE-OBS to MJD seconds, as `Time(t, format="isot").mjd * 86400`.
 pub fn utc_to_mjdsec(utc_time: &str) -> Result<f64> {
     const SEC_PER_DAY: f64 = 86400.0;
     let trimmed = utc_time.trim().trim_matches('\'').trim();
@@ -88,47 +30,15 @@ pub fn utc_to_mjdsec(utc_time: &str) -> Result<f64> {
     Ok(epoch.to_mjd_utc_days() * SEC_PER_DAY)
 }
 
-/// Read the frequency (Hz) or time (s) of a single image from its header.
-///
-/// * time mode: `DATE-OBS` → MJD seconds (2D or N-D).
-/// * frequency mode, 2D: the `REFFREQ` keyword (Hz).
-/// * frequency mode, N-D: the frequency of the first pixel of the FREQ axis.
+/// Frequency (Hz) or time (MJD seconds) of one image. See [`InputHeader::spec`].
 pub fn read_spec_from_header(path: &Path, time_domain_mode: bool) -> Result<f64> {
-    if time_domain_mode {
-        let date_obs = read_key_string(path, "DATE-OBS")?.ok_or_else(|| {
-            FitsCubeError::MissingKeyword(format!(
-                "DATE-OBS not in header of {} (needed for time-domain mode)",
-                path.display()
-            ))
-        })?;
-        return utc_to_mjdsec(&date_obs);
-    }
-
-    let geom = HeaderGeom::read(path)?;
-    if geom.is_2d() {
-        let reffreq = read_key_f64(path, "REFFREQ")?.ok_or_else(|| {
-            FitsCubeError::MissingKeyword(format!(
-                "REFFREQ not in header of {}. Cannot combine 2D images without \
-                 frequency information.",
-                path.display()
-            ))
-        })?;
-        return Ok(reffreq);
-    }
-
-    freq_at_first_pixel(path)
+    InputHeader::read(path)?.spec(path, time_domain_mode)
 }
 
-/// `isin_close`: for each element, is it close to *any* test element?
+/// For each element, whether it is close to any of `test`.
 ///
-/// NOTE: the original calls `np.isclose(element, test, atol, rtol)` with the
-/// `rtol`/`atol` positions swapped, so the effective tolerances differ from the
-/// variable names. We replicate the *effective* behaviour for bit-for-bit
-/// parity with `fitscube`:
-///   * frequency: `atol = 1e-5`, `rtol = 1e-9`
-///   * time:      `atol = 1e-10`, `rtol = 1e-9`
-///
-/// Closeness test: `|e − b| ≤ atol + rtol·|b|`.
+/// fitscube passes `atol` and `rtol` to `np.isclose` in swapped positions; these
+/// are the tolerances it ends up using.
 pub fn isin_close(elements: &[f64], test: &[f64], time_domain_mode: bool) -> Vec<bool> {
     let (atol, rtol) = if time_domain_mode {
         (1e-10, 1e-9)
@@ -141,8 +51,7 @@ pub fn isin_close(elements: &[f64], test: &[f64], time_domain_mode: bool) -> Vec
         .collect()
 }
 
-/// `np_arange_fix`: `np.arange` with a nudge so the stop endpoint is included
-/// when floating-point rounding would otherwise drop it.
+/// `np.arange(start, stop, step)`, nudged so rounding does not drop `stop`.
 fn np_arange_fix(start: f64, stop: f64, step: f64) -> Vec<f64> {
     let n = (stop - start) / step + 1.0;
     let x = n - n.trunc();
@@ -153,7 +62,6 @@ fn np_arange_fix(start: f64, stop: f64, step: f64) -> Vec<f64> {
     };
     let mut out = Vec::new();
     let mut v = start;
-    // Match numpy: stop is exclusive.
     while v < stop {
         out.push(v);
         v += step;
@@ -161,21 +69,16 @@ fn np_arange_fix(start: f64, stop: f64, step: f64) -> Vec<f64> {
     out
 }
 
-/// Fundamental channel step: the gcd of the observed diffs.
-///
-/// On a regular grid with missing channels every diff is an integer multiple
-/// of the channel width, so the gcd recovers that width even when no two
-/// surviving channels are adjacent — the case where `min(diffs)` overestimates
-/// the step (e.g. present channels 0, 3, 5 give `min = 2` but the true step is
-/// 1). Falls back to `min(diffs)` if the gcd is numerically unstable or does
-/// not divide every diff, so the common case is bit-for-bit unchanged (any
-/// surviving adjacent pair makes the gcd equal the minimum diff exactly).
-/// Largest step reduction `grid_step` accepts relative to the smallest diff.
+/// Smallest step `grid_step` accepts, as a fraction of the smallest diff.
 const MAX_BLANKS_PER_GAP: f64 = 16.0;
 
 /// Most grid points `even_spacing` builds per input value.
 const MAX_GRID_PER_INPUT: f64 = 1000.0;
 
+/// Channel width of a regular grid with missing channels: the gcd of the
+/// diffs, so channels 0, 3, 5 give 1 rather than `min(diffs) = 2`. Falls back
+/// to `min(diffs)` when the gcd does not divide every diff or is implausibly
+/// small.
 fn grid_step(diffs: &[f64]) -> f64 {
     let min_diff = diffs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_diff = diffs.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
@@ -188,7 +91,7 @@ fn grid_step(diffs: &[f64]) -> f64 {
         } else {
             (d.abs(), g)
         };
-        // Tolerant Euclid: stop once the remainder is within the noise floor.
+        // Euclid, stopping once the remainder is rounding noise
         while b > tol {
             let r = a % b;
             a = b;
@@ -201,8 +104,7 @@ fn grid_step(diffs: &[f64]) -> f64 {
         let q = d.abs() / g;
         (q - q.round()).abs() <= 1e-3
     });
-    // A float gcd can collapse to a tiny step (diffs 1e6 and 1e6 + 2 give 2),
-    // which would grid the axis into millions of blank channels.
+    // Diffs of 1e6 and 1e6 + 2 have a gcd of 2
     if g <= tol || !divides_all || g < min_diff / MAX_BLANKS_PER_GAP {
         min_diff
     } else {
@@ -210,17 +112,11 @@ fn grid_step(diffs: &[f64]) -> f64 {
     }
 }
 
-/// Build an evenly-spaced axis from possibly-uneven input values, flagging the
-/// interpolated gaps as missing channels. Mirrors `even_spacing`.
+/// Put `specs` on a regular grid and flag the grid points with no input.
 ///
-/// A regular grid cannot always hold every input — an irregular spacing whose
-/// step cannot be recovered leaves inputs sitting between grid points, and
-/// equal values collapse onto one. Those inputs would be dropped from the cube
-/// without trace, so this returns [`FitsCubeError::IrregularSpacing`] rather
-/// than a grid that is missing data.
+/// Returns [`FitsCubeError::IrregularSpacing`] if any input would fall between
+/// grid points or share one with another input.
 pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, Vec<bool>)> {
-    // The grid is built from the first and last value, so an unsorted input would
-    // otherwise give an empty (or reversed) grid. Callers sort later, not here.
     check_finite(specs)?;
     let mut sorted = specs.to_vec();
     sorted.sort_by(f64::total_cmp);
@@ -262,7 +158,6 @@ pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, 
     Ok((new_specs, missing))
 }
 
-/// Refuse NaN or infinite axis values, which cannot be sorted or gridded.
 fn check_finite(specs: &[f64]) -> Result<()> {
     match specs.iter().position(|v| !v.is_finite()) {
         Some(i) => Err(FitsCubeError::InvalidSpec(format!(
@@ -273,13 +168,13 @@ fn check_finite(specs: &[f64]) -> Result<()> {
     }
 }
 
-/// Parse the spectral/temporal axis for a set of input files.
+/// Axis values of the inputs and the cube.
 ///
-/// Mirrors `parse_specs_coro`. `spec_list` (the CLI `--specs`) supplies the
-/// per-file values directly; `spec_file` reads them one-per-line from a text
-/// file; otherwise they are read from each header.
+/// The values come from `spec_list`, from `spec_file` (one per line), or from
+/// each input's header.
 pub fn parse_specs(
-    file_list: &[std::path::PathBuf],
+    file_list: &[PathBuf],
+    headers: &[InputHeader],
     spec_file: Option<&Path>,
     spec_list: Option<&[f64]>,
     ignore_spec: bool,
@@ -298,55 +193,54 @@ pub fn parse_specs(
         });
     }
 
-    if spec_file.is_some() && spec_list.is_some() {
-        return Err(FitsCubeError::InvalidSpec(
-            "Must specify either spec_file or spec_list, not both".to_string(),
-        ));
-    }
-
-    let mut file_specs: Vec<f64> = if let Some(path) = spec_file {
-        tracing::info!("Reading spec values from {}", path.display());
-        let text = std::fs::read_to_string(path)?;
-        let vals: Vec<f64> = text
-            .split_whitespace()
-            .map(|t| t.parse::<f64>())
-            .collect::<std::result::Result<_, _>>()
-            .map_err(|e| FitsCubeError::InvalidSpec(format!("parsing {}: {e}", path.display())))?;
-        if vals.len() != n {
-            return Err(FitsCubeError::InvalidSpec(format!(
-                "Number of values in {} ({}) does not match number of images ({n})",
-                path.display(),
-                vals.len()
-            )));
+    let file_specs: Vec<f64> = match (spec_file, spec_list) {
+        (Some(_), Some(_)) => {
+            return Err(FitsCubeError::InvalidSpec(
+                "Must specify either spec_file or spec_list, not both".to_string(),
+            ));
         }
-        vals
-    } else if let Some(list) = spec_list {
-        if list.len() != n {
-            return Err(FitsCubeError::InvalidSpec(format!(
-                "Number of --specs values ({}) does not match number of images ({n})",
-                list.len()
-            )));
+        (Some(path), None) => {
+            tracing::info!("Reading spec values from {}", path.display());
+            let text = std::fs::read_to_string(path)?;
+            let vals: Vec<f64> = text
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| {
+                    FitsCubeError::InvalidSpec(format!("parsing {}: {e}", path.display()))
+                })?;
+            if vals.len() != n {
+                return Err(FitsCubeError::InvalidSpec(format!(
+                    "Number of values in {} ({}) does not match number of images ({n})",
+                    path.display(),
+                    vals.len()
+                )));
+            }
+            vals
         }
-        list.to_vec()
-    } else {
-        file_list
+        (None, Some(list)) => {
+            if list.len() != n {
+                return Err(FitsCubeError::InvalidSpec(format!(
+                    "Number of --specs values ({}) does not match number of images ({n})",
+                    list.len()
+                )));
+            }
+            list.to_vec()
+        }
+        (None, None) => file_list
             .iter()
-            .map(|p| read_spec_from_header(p, time_domain_mode))
-            .collect::<Result<Vec<f64>>>()?
+            .zip(headers)
+            .map(|(path, header)| header.spec(path, time_domain_mode))
+            .collect::<Result<_>>()?,
     };
-
     check_finite(&file_specs)?;
 
     let (specs, missing) = if create_blanks {
         tracing::info!("Creating an evenly-spaced axis with interpolated blanks");
         even_spacing(&file_specs, time_domain_mode)?
     } else {
-        (file_specs.clone(), vec![false; file_specs.len()])
+        (file_specs.clone(), vec![false; n])
     };
-
-    // Keep `file_specs` length == number of files.
-    file_specs.truncate(n);
-
     Ok(SpecInfo {
         file_specs,
         specs,
@@ -369,24 +263,19 @@ mod tests {
 
     #[test]
     fn gap_is_flagged_missing() {
-        // Missing the 3 GHz channel.
         let specs = vec![1.0e9, 2.0e9, 4.0e9];
         let (new, missing) = even_spacing(&specs, false).unwrap();
         assert_eq!(new.len(), 4);
-        // The interpolated 3 GHz slot is the only missing one.
         assert_eq!(missing.iter().filter(|&&m| m).count(), 1);
         assert!(missing[2]);
     }
 
     #[test]
     fn non_adjacent_gaps_recover_true_step() {
-        // Present channels 0, 3, 5 on a unit grid (1, 2, 4 missing). No two
-        // surviving channels are adjacent, so `min(diffs) == 2` would mis-grid
-        // the axis to [0, 2, 4] and drop the real channels. The gcd of the
-        // diffs [3, 2] recovers the true step of 1.
+        // min(diffs) == 2 would grid to [0, 2, 4] and drop channels 3 and 5
         let specs = vec![0.0, 3.0, 5.0];
         let (new, missing) = even_spacing(&specs, false).unwrap();
-        assert_eq!(new.len(), 6, "should rebuild the full 0..=5 grid");
+        assert_eq!(new.len(), 6);
         assert_eq!(missing.iter().filter(|&&m| m).count(), 3);
         let expected = [false, true, true, false, true, false];
         assert_eq!(missing, expected);
@@ -443,19 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn freq_units() {
-        assert_eq!(freq_unit_to_hz(None).unwrap(), 1.0);
-        assert_eq!(freq_unit_to_hz(Some("MHz")).unwrap(), 1e6);
-        assert_eq!(freq_unit_to_hz(Some("GHz ")).unwrap(), 1e9);
-        assert!(matches!(
-            freq_unit_to_hz(Some("m/s")),
-            Err(FitsCubeError::InvalidSpec(_))
-        ));
-    }
-
-    #[test]
     fn mjdsec_round_number() {
-        // 1858-11-17T00:00:00 is MJD 0.
         let s = utc_to_mjdsec("1858-11-17T00:00:00").unwrap();
         assert_relative_eq!(s, 0.0, epsilon = 1e-3);
     }

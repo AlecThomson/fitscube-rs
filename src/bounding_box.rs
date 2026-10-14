@@ -1,10 +1,7 @@
-//! Bounding-box geometry for trimming blank padding from images.
+//! The box around the finite pixels of an image, used to trim blank padding.
 //!
-//! Port of `fitscube.bounding_box`. A [`BoundingBox`] captures the pixel extent
-//! of the finite (non-NaN) data in a 2D image so that padded regions can be
-//! clipped when building a cube. The naming follows the Python original, where
-//! `x` is the slow (row / axis-0) direction and `y` is the fast (column /
-//! axis-1) direction.
+//! As in fitscube, `x` is the row (numpy axis 0, FITS NAXIS2) and `y` the
+//! column (numpy axis 1, FITS NAXIS1).
 use std::path::{Path, PathBuf};
 
 use fitsio::FitsFile;
@@ -13,33 +10,24 @@ use num_traits::Float;
 use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
-use crate::fits_io::HeaderGeom;
+use crate::pixels::{Pixel, read_pixels};
 
-/// Pixel bounds of the valid (finite) region of a 2D image.
-///
-/// `*max` bounds are exclusive and may be used directly as the upper end of a
-/// slice (matching the Python `dataclass`).
+/// Pixel bounds of the finite data of a plane. Maxima are exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundingBox {
-    /// Minimum x pixel (row / axis-0), inclusive.
     pub xmin: usize,
-    /// Maximum x pixel (row / axis-0), exclusive.
     pub xmax: usize,
-    /// Minimum y pixel (column / axis-1), inclusive.
     pub ymin: usize,
-    /// Maximum y pixel (column / axis-1), exclusive.
     pub ymax: usize,
-    /// Shape `(nrows, ncols)` of the plane the box was built from.
+    /// `(nrows, ncols)` of the plane.
     pub original_shape: (usize, usize),
-    /// `ymax - ymin`.
+    /// `ymax - ymin`, the trimmed NAXIS1.
     pub y_span: usize,
-    /// `xmax - xmin`.
+    /// `xmax - xmin`, the trimmed NAXIS2.
     pub x_span: usize,
 }
 
 impl BoundingBox {
-    /// A box over rows `xmin..xmax` and columns `ymin..ymax` of a plane of
-    /// shape `(nrows, ncols)`.
     pub fn new(
         xmin: usize,
         xmax: usize,
@@ -59,48 +47,24 @@ impl BoundingBox {
     }
 }
 
-/// Build a bounding box around the finite pixels of a 2D image.
-///
-/// Returns `None` if no pixel is finite (nothing to bound). Mirrors
-/// `create_bound_box_plane`: `x` indexes rows (axis 0), `y` indexes columns
-/// (axis 1); the `*max` values are made exclusive (`+1`).
+/// Box around the finite pixels of `image`, or `None` if there are none.
 pub fn create_bound_box_plane<T: Float>(image: &ArrayView2<T>) -> Option<BoundingBox> {
     let (nrows, ncols) = image.dim();
-
-    let mut xmin: Option<usize> = None;
-    let mut xmax = 0usize;
-    let mut ymin: Option<usize> = None;
-    let mut ymax = 0usize;
-    let mut any_valid = false;
-
-    for r in 0..nrows {
-        for c in 0..ncols {
-            if image[(r, c)].is_finite() {
-                any_valid = true;
-                if xmin.is_none() {
-                    xmin = Some(r);
-                }
-                xmax = r;
-                if ymin.is_none_or(|y| c < y) {
-                    ymin = Some(c);
-                }
-                if c > ymax {
-                    ymax = c;
-                }
-            }
-        }
+    let mut rows: Option<(usize, usize)> = None;
+    let (mut ymin, mut ymax) = (ncols, 0);
+    for (r, row) in image.rows().into_iter().enumerate() {
+        let Some(first) = row.iter().position(|v| v.is_finite()) else {
+            continue;
+        };
+        let last = row.iter().rposition(|v| v.is_finite()).unwrap_or(first);
+        rows = Some((rows.map_or(r, |(xmin, _)| xmin), r));
+        ymin = ymin.min(first);
+        ymax = ymax.max(last);
     }
-
-    if !any_valid {
+    let Some((xmin, xmax)) = rows else {
         tracing::info!("No pixels to create bounding box for");
         return None;
-    }
-
-    // xmin is set once we have seen any valid pixel; xmax tracks the last valid
-    // row. ymin/ymax track first/last valid column. `+1` makes the max bounds
-    // exclusive, matching numpy slicing in the Python original.
-    let xmin = xmin.expect("any_valid implies xmin set");
-    let ymin = ymin.expect("any_valid implies ymin set");
+    };
     Some(BoundingBox::new(
         xmin,
         xmax + 1,
@@ -110,48 +74,61 @@ pub fn create_bound_box_plane<T: Float>(image: &ArrayView2<T>) -> Option<Boundin
     ))
 }
 
-/// Bounding box of the valid data of one FITS image. Mirrors
-/// `get_bounding_box_for_fits`.
+/// Box around the finite pixels of one image, or `None` if there are none.
 ///
-/// Degenerate axes are dropped, so the image must hold a single 2D plane.
-/// `None` if every pixel is invalid.
+/// The image must hold one plane once degenerate axes are dropped.
 pub fn get_bounding_box_for_fits(
     path: &Path,
     invalidate_zeros: bool,
 ) -> Result<Option<BoundingBox>> {
-    let geom = HeaderGeom::read(path)?;
-    let squeezed: Vec<usize> = geom.dims.iter().copied().filter(|&n| n != 1).collect();
-    let (nrows, ncols) = match squeezed.as_slice() {
-        [ncols, nrows] => (*nrows, *ncols),
-        _ => {
-            return Err(FitsCubeError::ShapeMismatch(format!(
-                "Only two-dimensional images can be bounded, but {} has shape {:?}",
-                path.display(),
-                geom.dims
-            )));
-        }
-    };
-    let mut fptr = FitsFile::open(path.to_string_lossy().as_ref())?;
+    crate::combine::check_exists(path)?;
+    let mut fptr = FitsFile::open(path)?;
     let hdu = fptr.primary_hdu()?;
-    let mut data: Vec<f64> = hdu.read_image(&mut fptr)?;
+    let (dims, bitpix): (Vec<usize>, i64) = match &hdu.info {
+        fitsio::hdu::HduInfo::ImageInfo { shape, .. } => (
+            shape.iter().rev().copied().collect(),
+            hdu.read_key(&mut fptr, "BITPIX")?,
+        ),
+        _ => (vec![], 0),
+    };
+    let squeezed: Vec<usize> = dims.iter().copied().filter(|&n| n != 1).collect();
+    let [ncols, nrows] = squeezed[..] else {
+        return Err(FitsCubeError::ShapeMismatch(format!(
+            "Only two-dimensional images can be bounded, but {} has shape {dims:?}",
+            path.display(),
+        )));
+    };
+    if bitpix == -64 {
+        plane_box::<f64>(&mut fptr, &dims, (nrows, ncols), bitpix, invalidate_zeros)
+    } else {
+        plane_box::<f32>(&mut fptr, &dims, (nrows, ncols), bitpix, invalidate_zeros)
+    }
+}
+
+fn plane_box<T: Pixel + Float>(
+    fptr: &mut FitsFile,
+    dims: &[usize],
+    shape: (usize, usize),
+    bitpix: i64,
+    invalidate_zeros: bool,
+) -> Result<Option<BoundingBox>> {
+    let mut data = Vec::new();
+    // BLANK pixels of an integer image are not data
+    read_pixels(fptr, dims, None, (bitpix > 0).then(T::nan), &mut data)?;
     if invalidate_zeros {
-        for v in &mut data {
-            if *v == 0.0 {
-                *v = f64::NAN;
-            }
+        for v in data.iter_mut().filter(|v| v.is_zero()) {
+            *v = T::nan();
         }
     }
-    let view = ArrayView2::from_shape((nrows, ncols), &data)?;
+    let view = ArrayView2::from_shape(shape, &data)
+        .map_err(|e| FitsCubeError::ShapeMismatch(e.to_string()))?;
     Ok(create_bound_box_plane(&view))
 }
 
-/// The single bounding box that encompasses the valid data of every image in
-/// `file_list`. Mirrors `get_common_bounding_box`.
+/// The smallest box holding the finite pixels of every image in `file_list`.
 ///
-/// This is the box [`crate::combine_fits`] computes internally with
-/// `bounding_box: true`. Compute it once with this function and pass it as
-/// `supplied_bounding_box` when several cubes (e.g. an image cube and its
-/// weights cube) must land on an identical pixel grid.
+/// Pass it to several combines as `supplied_bounding_box` to put them on one
+/// pixel grid, such as an image cube and its weights.
 pub fn get_common_bounding_box(
     file_list: &[PathBuf],
     invalidate_zeros: bool,
@@ -163,33 +140,27 @@ pub fn get_common_bounding_box(
     extract_common_bounding_box(&boxes)
 }
 
-/// Smallest bounding box that encompasses all the given boxes.
-///
-/// `None` entries (returned for fully blank images) are skipped. Errors if no
-/// valid box remains or if the boxes disagree on `original_shape`. Mirrors
-/// `extract_common_bounding_box`.
+/// The smallest box holding all of `boxes`, skipping `None`s.
 pub fn extract_common_bounding_box(boxes: &[Option<BoundingBox>]) -> Result<BoundingBox> {
-    let valid: Vec<&BoundingBox> = boxes.iter().filter_map(|b| b.as_ref()).collect();
-
-    if valid.is_empty() {
-        return Err(FitsCubeError::Other(
-            "No valid input boxes to consider".to_string(),
+    let valid: Vec<&BoundingBox> = boxes.iter().flatten().collect();
+    let Some(first) = valid.first() else {
+        return Err(FitsCubeError::NoValidData);
+    };
+    if valid
+        .iter()
+        .any(|b| b.original_shape != first.original_shape)
+    {
+        return Err(FitsCubeError::ShapeMismatch(
+            "bounding boxes come from planes of different shapes".to_string(),
         ));
     }
-
-    let shape0 = valid[0].original_shape;
-    if !valid.iter().all(|b| b.original_shape == shape0) {
-        return Err(FitsCubeError::Other(
-            "Different shapes, and not sure this is really supported or meaningful".to_string(),
-        ));
-    }
-
-    let xmin = valid.iter().map(|b| b.xmin).min().unwrap();
-    let xmax = valid.iter().map(|b| b.xmax).max().unwrap();
-    let ymin = valid.iter().map(|b| b.ymin).min().unwrap();
-    let ymax = valid.iter().map(|b| b.ymax).max().unwrap();
-
-    Ok(BoundingBox::new(xmin, xmax, ymin, ymax, shape0))
+    Ok(BoundingBox::new(
+        valid.iter().map(|b| b.xmin).min().unwrap_or(0),
+        valid.iter().map(|b| b.xmax).max().unwrap_or(0),
+        valid.iter().map(|b| b.ymin).min().unwrap_or(0),
+        valid.iter().map(|b| b.ymax).max().unwrap_or(0),
+        first.original_shape,
+    ))
 }
 
 #[cfg(test)]

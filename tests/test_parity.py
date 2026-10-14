@@ -19,6 +19,7 @@ import fitscube_rs
 
 # The reference implementation. Skip the whole module if it is not installed.
 fitscube = pytest.importorskip("fitscube")
+fitscube_extract = pytest.importorskip("fitscube.extract")
 
 
 def _write_image(
@@ -28,10 +29,8 @@ def _write_image(
     reffreq: float | None = None,
     date_obs: str | None = None,
     beam: float | None = None,
-    # 30x30 planes keep the cube well above fitscube's 1801-element small-cube
-    # threshold. (Older fitscube builds corrupted data on the in-memory
-    # small-cube path; v2.3.0 fixed it, but staying large keeps the tests robust
-    # across reference versions.)
+    # Above fitscube's 1801-element small-cube path, which corrupted data
+    # before v2.3.0
     ny: int = 30,
     nx: int = 30,
 ) -> None:
@@ -544,3 +543,29 @@ def test_supplied_bounding_box(tmp_path):
     assert (
         fitscube_rs.get_common_bounding_box(make_weights(tmp_path / "rs")).x_span == 30
     )
+
+
+def test_extract_planes_from_cube(tmp_path):
+    """Every plane, beam included, matches fitscube's extraction."""
+    freqs = [1.0e9, 2.0e9, 3.0e9]
+    beams = [10.0 / 3600.0, 11.0 / 3600.0, 12.0 / 3600.0]
+    files = _make_freq_images(tmp_path / "in", freqs, beams=beams)
+    cube = tmp_path / "cube.fits"
+    fitscube_rs.combine_fits(files, cube)
+
+    ref_paths = fitscube_extract.extract_planes_from_cube(
+        cube,
+        fitscube_extract.ExtractPlanesOptions(
+            output_paths=[tmp_path / f"ref{i}.fits" for i in range(3)]
+        ),
+    )
+    rs_paths = fitscube_rs.extract_planes_from_cube(
+        cube, output_paths=[tmp_path / f"rs{i}.fits" for i in range(3)]
+    )
+    for ref, rs in zip(ref_paths, rs_paths, strict=True):
+        with fits.open(ref) as ref_hdul, fits.open(rs) as rs_hdul:
+            np.testing.assert_array_equal(rs_hdul[0].data, ref_hdul[0].data)
+            ref_h, rs_h = ref_hdul[0].header, rs_hdul[0].header
+            for key in ("NAXIS3", "CRPIX3", "CRVAL3", "CDELT3", "BMAJ", "BMIN", "BPA"):
+                assert rs_h[key] == pytest.approx(ref_h[key], rel=1e-6), key
+            assert "CASAMBM" not in rs_h

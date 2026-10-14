@@ -1,8 +1,5 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-//! Python bindings (`fitscube_rs._fitscube_rs`).
-//!
-//! Thin wrappers over [`crate::combine`] and [`crate::extract`]; all the FITS
-//! work happens in Rust against file paths.
+//! Python bindings (`fitscube_rs._fitscube_rs`) over [`crate::combine`] and
+//! [`crate::extract`].
 use std::path::PathBuf;
 
 use pyo3::exceptions::{
@@ -15,7 +12,10 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 use crate::bounding_box::{BoundingBox, get_common_bounding_box as rust_common_bounding_box};
 use crate::combine::{CombineOptions, combine_fits as rust_combine_fits};
 use crate::error::FitsCubeError;
-use crate::extract::{ExtractOptions, extract_plane_from_cube as rust_extract};
+use crate::extract::{
+    ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube as rust_extract,
+    extract_planes_from_cube as rust_extract_planes,
+};
 
 // Defined in fitscube_rs/__init__.py, with the names of fitscube.exceptions
 pyo3::import_exception!(fitscube_rs, TargetAxisMissingException);
@@ -41,7 +41,7 @@ fn to_py_err(e: FitsCubeError) -> PyErr {
         // FileNotFoundError, PermissionError, ... by error kind
         FitsCubeError::Io(e) => e.into(),
         FitsCubeError::Fits(_) => PyOSError::new_err(msg),
-        FitsCubeError::ThreadPool(_) => PyRuntimeError::new_err(msg),
+        FitsCubeError::ThreadPool(_) | FitsCubeError::WorkerPanic => PyRuntimeError::new_err(msg),
         _ => PyValueError::new_err(msg),
     }
 }
@@ -114,13 +114,13 @@ impl PyBoundingBox {
         self.0.original_shape
     }
 
-    /// The span between ymax and ymin (i.e. the trimmed NAXIS1).
+    /// ``ymax - ymin``, the trimmed NAXIS1.
     #[getter]
     fn y_span(&self) -> usize {
         self.0.y_span
     }
 
-    /// The span between xmax and xmin (i.e. the trimmed NAXIS2).
+    /// ``xmax - xmin``, the trimmed NAXIS2.
     #[getter]
     fn x_span(&self) -> usize {
         self.0.x_span
@@ -150,13 +150,11 @@ impl pyo3_stub_gen::PyStubType for BoundingBoxArg {
     }
 }
 
-/// Compute the single bounding box that encompasses the valid data of every
-/// image in ``file_list``.
+/// The smallest box holding the finite pixels of every image in ``file_list``.
 ///
-/// This is the box ``combine_fits`` computes internally when
-/// ``bounding_box=True``. Compute it once with this function and pass the
-/// result to ``combine_fits(bounding_box=...)`` when several cubes (e.g. an
-/// image cube and its weights cube) must land on an identical pixel grid.
+/// This is the box ``combine_fits(bounding_box=True)`` uses. Pass it as
+/// ``combine_fits(bounding_box=box)`` to put several cubes, such as an image
+/// cube and its weights, on the same pixel grid.
 ///
 /// Args:
 ///     file_list (list[str]): The FITS images to consider.
@@ -271,7 +269,6 @@ fn combine_fits(
         supplied_bounding_box,
         invalidate_zeros,
         float_length,
-        // No stderr progress bars when driven from Python.
         progress: false,
         blank_zero_beams,
     };
@@ -333,6 +330,61 @@ fn extract_plane_from_cube(
         .map_err(to_py_err)
 }
 
+/// Extract every channel of a FITS cube into its own image.
+///
+/// The cube and its beam table are read once.
+///
+/// Args:
+///     fits_cube (str): The cube to extract from.
+///     hdu_index (int): HDU index of the cube data (default 0).
+///     overwrite (bool): Overwrite output files that exist.
+///     output_paths (list[str], optional): One output path per channel.
+///         Defaults to ``cube.channel-N.fits`` beside the cube.
+///     max_workers (int, optional): Planes written at once (default 4).
+///         ``None`` uses every core.
+///
+/// Returns:
+///     list[str]: The path of each channel's image, in channel order.
+///
+/// Raises:
+///     FileExistsError: If an output exists and ``overwrite`` is not set.
+///     FileNotFoundError: If the cube does not exist.
+///     TargetAxisMissingException: If the cube has no FREQ axis.
+///     ShapeMismatchException: If ``output_paths`` does not match the channels.
+///     OSError: On a FITS read or write error.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (
+    fits_cube,
+    hdu_index=0,
+    overwrite=false,
+    output_paths=None,
+    max_workers=Some(4),
+))]
+fn extract_planes_from_cube(
+    py: Python<'_>,
+    fits_cube: PathBuf,
+    hdu_index: usize,
+    overwrite: bool,
+    output_paths: Option<Vec<PathBuf>>,
+    max_workers: Option<usize>,
+) -> PyResult<Vec<String>> {
+    let options = ExtractPlanesOptions {
+        hdu_index,
+        overwrite,
+        output_paths,
+        max_workers,
+    };
+    py.detach(|| rust_extract_planes(&fits_cube, &options))
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect()
+        })
+        .map_err(to_py_err)
+}
+
 #[cfg(feature = "stubgen")]
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
@@ -358,6 +410,7 @@ pub fn _fitscube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(combine_fits, m)?)?;
     m.add_function(wrap_pyfunction!(get_common_bounding_box, m)?)?;
     m.add_function(wrap_pyfunction!(extract_plane_from_cube, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_planes_from_cube, m)?)?;
     #[cfg(feature = "stubgen")]
     m.add_function(wrap_pyfunction!(_generate_stubs, m)?)?;
     Ok(())

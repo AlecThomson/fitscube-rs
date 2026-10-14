@@ -1,30 +1,30 @@
-//! Combine single-frequency (or single-time) FITS images into a FITS cube.
+//! Combine single-frequency (or single-time) FITS images into a cube, and
+//! extract planes from one.
 //!
 //! A Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube)
-//! Python package. Also available as a Python package (`fitscube_rs`) and a CLI
-//! tool (`fitscubers`).
+//! Python package, also built as a Python module (`fitscube_rs`) and a CLI
+//! (`fitscubers`).
 //!
-//! # Overview
+//! - [`combine_fits`] stacks images along frequency or time, with optional
+//!   blank channels, per-channel beams and bounding-box trimming.
+//! - [`extract_plane_from_cube`] and [`extract_planes_from_cube`] pull planes
+//!   back out.
 //!
-//! - [`combine_fits`]: stack a list of images into a cube along the frequency
-//!   or time axis ([`combine`] module), handling uneven spacing, blank-channel
-//!   interpolation, per-channel beams, and bounding-box trimming.
-//! - [`extract_plane_from_cube`]: pull one channel/timestep back out of a cube
-//!   ([`extract`] module).
-//!
-//! Assumptions (inherited from the original): all inputs share the same WCS,
-//! pixel grid, axes and Stokes parameter (the last three are checked), and the frequency/time of each image is available either as a WCS
-//! axis, the `REFFREQ` keyword, or the `DATE-OBS` keyword (time mode).
+//! The inputs must share a pixel grid, axes and Stokes parameter (checked).
+//! Each image's frequency comes from its FREQ axis or REFFREQ, and its time
+//! from DATE-OBS.
 pub mod beams;
 pub mod bounding_box;
 pub mod checks;
 pub mod combine;
+pub mod compress;
 pub mod error;
 pub mod extract;
-pub mod fits_io;
-mod keys;
+mod partial;
+mod pixels;
 pub mod progress;
 pub mod specs;
+mod wcs;
 
 pub use beams::Beam;
 pub use bounding_box::{
@@ -32,7 +32,9 @@ pub use bounding_box::{
 };
 pub use combine::{CombineOptions, combine_fits};
 pub use error::{FitsCubeError, Result};
-pub use extract::{ExtractOptions, extract_plane_from_cube};
+pub use extract::{
+    ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube, extract_planes_from_cube,
+};
 
 #[cfg(feature = "python")]
 mod python;
