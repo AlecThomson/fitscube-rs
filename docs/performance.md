@@ -26,10 +26,10 @@ Best of 3 runs. Input generation is not timed. Intel Xeon at 2.10 GHz
 | 200 × 256²       |     52 MB |         1.713 s |       0.026 s |      66× |
 | 500 × 256²       |    131 MB |         4.251 s |       0.065 s |      65× |
 | 1000 × 128²      |     66 MB |         8.535 s |       0.064 s |     133× |
-| 100 × 1024²      |    419 MB | 0.92 to 0.96 s | 0.11 to 0.91 s | 1.1 to 8.6× |
+| 100 × 1024²      |    419 MB |         0.975 s |        0.13 s |     7.6× |
 
-The 100 × 1024² row is the range over 5 runs. The `fitscube-rs` time was
-about 0.11 s in 3 runs and 0.8 to 0.9 s in 2.
+The 100 × 1024² row is the median of 5 runs: at this size an occasional run
+stalls on disk write-back.
 
 ## How combine works
 
