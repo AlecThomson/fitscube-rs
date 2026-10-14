@@ -189,7 +189,7 @@ fn get_common_bounding_box(
 ///         one per line. Mutually exclusive with ``spec_list``.
 ///     spec_list (list[float], optional): Frequencies/times supplied directly.
 ///         Mutually exclusive with ``spec_file``.
-///     ignore_spec (bool): Ignore frequency/time info and just stack.
+///     ignore_spec (bool): Ignore frequency/time info and stack in the given order.
 ///     create_blanks (bool): Interpolate an evenly-spaced axis, blanking gaps.
 ///     overwrite (bool): Overwrite the output cube if it exists.
 ///     max_workers (int, optional): Number of threads reading input images.

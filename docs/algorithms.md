@@ -66,7 +66,7 @@ from plane to plane.
   supported; a multi-Stokes cube with varying beams is refused before any data
   are written.
 - Beams follow the planes when they are sorted, and blank channels get a NaN
-  beam. Any input with a beam counts, not just the first.
+  beam. The beam of any input counts, not only the first.
 - CASA cannot read NaN, so a NaN beam is stored as `numpy.finfo(float32).tiny`,
   as is a beam with a zero axis.
 
