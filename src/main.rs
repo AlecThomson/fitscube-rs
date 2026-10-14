@@ -60,7 +60,7 @@ struct CombineArgs {
     /// Increase output verbosity (repeatable).
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbosity: u8,
-    /// Maximum number of in-flight planes (concurrency bound).
+    /// Number of threads reading input images (default: one per core).
     #[arg(long)]
     max_workers: Option<usize>,
     /// Trim blank padding around the data using a common bounding box.
@@ -70,8 +70,8 @@ struct CombineArgs {
     #[arg(long)]
     invalidate_zeros: bool,
     /// Output float precision in bits (32 or 64). Defaults to the input.
-    #[arg(long, value_parser = ["32", "64"])]
-    floating: Option<String>,
+    #[arg(long, value_parser = parse_floating)]
+    floating: Option<u8>,
     /// Keep images whose restoring beam is exactly zero. By default such images
     /// are blanked with NaNs, as a zero beam means no PSF was fitted for that
     /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
@@ -103,6 +103,14 @@ struct ExtractArgs {
     output_path: Option<PathBuf>,
 }
 
+fn parse_floating(s: &str) -> std::result::Result<u8, String> {
+    match s {
+        "32" => Ok(32),
+        "64" => Ok(64),
+        _ => Err(format!("{s} is not a FITS float width; use 32 or 64")),
+    }
+}
+
 fn init_logging(verbosity: u8) {
     let level = match verbosity {
         0 => "warn",
@@ -120,11 +128,17 @@ fn init_logging(verbosity: u8) {
 fn run_combine(args: CombineArgs) -> Result<()> {
     init_logging(args.verbosity);
 
-    if !args.overwrite && args.out_cube.exists() {
-        anyhow::bail!(
-            "Output file {} already exists. Use --overwrite to overwrite.",
-            args.out_cube.display()
-        );
+    let unit = if args.time_domain { "s" } else { "Hz" };
+    let specs_file = args.out_cube.with_extension(format!("specs_{unit}.txt"));
+    if !args.overwrite {
+        for path in [&args.out_cube, &specs_file] {
+            if path.exists() {
+                anyhow::bail!(
+                    "Output file {} already exists. Use --overwrite to overwrite.",
+                    path.display()
+                );
+            }
+        }
     }
 
     let options = CombineOptions {
@@ -138,7 +152,7 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         bounding_box: args.bounding_box,
         supplied_bounding_box: None,
         invalidate_zeros: args.invalidate_zeros,
-        float_length: args.floating.as_deref().map(|s| s.parse().unwrap()),
+        float_length: args.floating,
         blank_zero_beams: !args.no_blank_zero_beams,
         // CLI: show progress bars on stderr.
         progress: true,
@@ -150,8 +164,6 @@ fn run_combine(args: CombineArgs) -> Result<()> {
     info!("Written cube to {}", args.out_cube.display());
 
     // Write the axis values alongside the cube, as the original CLI does.
-    let unit = if args.time_domain { "s" } else { "Hz" };
-    let specs_file = args.out_cube.with_extension(format!("specs_{unit}.txt"));
     let body: String = specs.iter().map(|v| format!("{v}\n")).collect::<String>();
     std::fs::write(&specs_file, body)
         .with_context(|| format!("writing spec values to {}", specs_file.display()))?;

@@ -5,7 +5,9 @@
 //! work happens in Rust against file paths.
 use std::path::PathBuf;
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{
+    PyFileExistsError, PyNotImplementedError, PyOSError, PyRuntimeError, PyValueError,
+};
 use pyo3::prelude::*;
 #[cfg(feature = "stubgen")]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
@@ -15,8 +17,33 @@ use crate::combine::{CombineOptions, combine_fits as rust_combine_fits};
 use crate::error::FitsCubeError;
 use crate::extract::{ExtractOptions, extract_plane_from_cube as rust_extract};
 
+// Defined in fitscube_rs/__init__.py, with the names of fitscube.exceptions
+pyo3::import_exception!(fitscube_rs, TargetAxisMissingException);
+pyo3::import_exception!(fitscube_rs, ChannelMissingException);
+pyo3::import_exception!(fitscube_rs, ShapeMismatchException);
+pyo3::import_exception!(fitscube_rs, AxisMismatchException);
+pyo3::import_exception!(fitscube_rs, StokesMismatchException);
+pyo3::import_exception!(fitscube_rs, AxisOrderException);
+pyo3::import_exception!(fitscube_rs, IrregularSpacingException);
+
 fn to_py_err(e: FitsCubeError) -> PyErr {
-    PyValueError::new_err(e.to_string())
+    let msg = e.to_string();
+    match e {
+        FitsCubeError::TargetAxisMissing(_) => TargetAxisMissingException::new_err(msg),
+        FitsCubeError::ChannelMissing(_) => ChannelMissingException::new_err(msg),
+        FitsCubeError::ShapeMismatch(_) => ShapeMismatchException::new_err(msg),
+        FitsCubeError::AxisMismatch(_) => AxisMismatchException::new_err(msg),
+        FitsCubeError::StokesMismatch(_) => StokesMismatchException::new_err(msg),
+        FitsCubeError::AxisOrder(_) => AxisOrderException::new_err(msg),
+        FitsCubeError::IrregularSpacing(_) => IrregularSpacingException::new_err(msg),
+        FitsCubeError::NotImplemented(_) => PyNotImplementedError::new_err(msg),
+        FitsCubeError::OutputExists(_) => PyFileExistsError::new_err(msg),
+        // FileNotFoundError, PermissionError, ... by error kind
+        FitsCubeError::Io(e) => e.into(),
+        FitsCubeError::Fits(_) => PyOSError::new_err(msg),
+        FitsCubeError::ThreadPool(_) => PyRuntimeError::new_err(msg),
+        _ => PyValueError::new_err(msg),
+    }
 }
 
 /// Pixel bounds of the valid data of an image, as used to trim a cube.
@@ -139,15 +166,18 @@ impl pyo3_stub_gen::PyStubType for BoundingBoxArg {
 ///     BoundingBox: The smallest bounding box that contains all valid data.
 ///
 /// Raises:
-///     ValueError: If no image has valid data, or on a FITS error.
+///     FileNotFoundError: If an input does not exist.
+///     OSError: On a FITS read error.
+///     ValueError: If no image has valid data.
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (file_list, invalidate_zeros=false))]
 fn get_common_bounding_box(
+    py: Python<'_>,
     file_list: Vec<PathBuf>,
     invalidate_zeros: bool,
 ) -> PyResult<PyBoundingBox> {
-    rust_common_bounding_box(&file_list, invalidate_zeros)
+    py.detach(|| rust_common_bounding_box(&file_list, invalidate_zeros))
         .map(PyBoundingBox)
         .map_err(to_py_err)
 }
@@ -164,7 +194,8 @@ fn get_common_bounding_box(
 ///     ignore_spec (bool): Ignore frequency/time info and just stack.
 ///     create_blanks (bool): Interpolate an evenly-spaced axis, blanking gaps.
 ///     overwrite (bool): Overwrite the output cube if it exists.
-///     max_workers (int, optional): Concurrency bound for in-flight planes.
+///     max_workers (int, optional): Number of threads reading input images.
+///         Defaults to one per core.
 ///     time_domain_mode (bool): Combine along time (DATE-OBS) instead of FREQ.
 ///     bounding_box (bool | BoundingBox): Trim blank padding via a common
 ///         bounding box. A ``BoundingBox`` is used as is (see
@@ -180,7 +211,16 @@ fn get_common_bounding_box(
 ///     list[float]: The output-axis values (Hz for frequency, MJD s for time).
 ///
 /// Raises:
-///     ValueError: On invalid input or a FITS error.
+///     FileExistsError: If ``out_cube`` exists and ``overwrite`` is not set.
+///     FileNotFoundError: If an input does not exist.
+///     ShapeMismatchException, AxisMismatchException, StokesMismatchException:
+///         If the inputs cannot share one cube header.
+///     AxisOrderException: If the combine axis would not be the slowest.
+///     IrregularSpacingException: If ``create_blanks`` cannot grid the inputs.
+///     TargetAxisMissingException: If an N-D input has no FREQ axis.
+///     NotImplementedError: For per-channel beams on a multi-Stokes cube.
+///     OSError: On a FITS read or write error.
+///     ValueError: On other invalid input.
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (
@@ -200,6 +240,7 @@ fn get_common_bounding_box(
 ))]
 #[allow(clippy::too_many_arguments)]
 fn combine_fits(
+    py: Python<'_>,
     file_list: Vec<PathBuf>,
     out_cube: PathBuf,
     spec_file: Option<PathBuf>,
@@ -234,7 +275,8 @@ fn combine_fits(
         progress: false,
         blank_zero_beams,
     };
-    rust_combine_fits(&file_list, &out_cube, &options).map_err(to_py_err)
+    py.detach(|| rust_combine_fits(&file_list, &out_cube, &options))
+        .map_err(to_py_err)
 }
 
 /// Extract a single plane (channel or timestep) from a FITS cube.
@@ -254,7 +296,12 @@ fn combine_fits(
 ///     str: Path of the written plane image.
 ///
 /// Raises:
-///     ValueError: On invalid options or a FITS error.
+///     FileExistsError: If the output exists and ``overwrite`` is not set.
+///     FileNotFoundError: If the cube does not exist.
+///     TargetAxisMissingException: If the cube has no FREQ/TIME axis.
+///     ChannelMissingException: If the index is outside the cube.
+///     OSError: On a FITS read or write error.
+///     ValueError: On invalid options.
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
 #[pyo3(signature = (
@@ -266,6 +313,7 @@ fn combine_fits(
     output_path=None,
 ))]
 fn extract_plane_from_cube(
+    py: Python<'_>,
     fits_cube: PathBuf,
     channel_index: Option<usize>,
     time_index: Option<usize>,
@@ -280,7 +328,7 @@ fn extract_plane_from_cube(
         overwrite,
         output_path,
     };
-    rust_extract(&fits_cube, &options)
+    py.detach(|| rust_extract(&fits_cube, &options))
         .map(|p| p.to_string_lossy().into_owned())
         .map_err(to_py_err)
 }

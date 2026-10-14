@@ -19,6 +19,10 @@ pub enum FitsCubeError {
     #[error("FITS I/O error: {0}")]
     Fits(#[from] fitsio::errors::Error),
 
+    /// The worker thread pool could not be started.
+    #[error("thread pool: {0}")]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
+
     /// Filesystem I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -61,6 +65,11 @@ pub enum FitsCubeError {
     #[error("Stokes mismatch: {0}")]
     StokesMismatch(String),
 
+    /// Integer inputs differ in BITPIX, BSCALE, BZERO or BLANK, so their stored
+    /// values cannot share one integer cube.
+    #[error("scaling mismatch: {0}")]
+    ScalingMismatch(String),
+
     /// The combine axis is not the slowest-varying axis of the cube.
     ///
     /// Equivalent to Python `AxisOrderException`.
@@ -82,6 +91,10 @@ pub enum FitsCubeError {
     /// The output file already exists and `overwrite` was not set.
     #[error("output file {0} already exists (use overwrite)")]
     OutputExists(PathBuf),
+
+    /// The output path is the input file.
+    #[error("output {0} is the input file")]
+    OutputIsInput(PathBuf),
 
     /// Mutually exclusive spectral-input options were combined, or a count
     /// mismatch was detected.

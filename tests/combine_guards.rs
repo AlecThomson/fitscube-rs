@@ -9,7 +9,8 @@ use fitscube_rs::bounding_box::{BoundingBox, get_common_bounding_box};
 use fitscube_rs::checks::{check_matching_axes, check_matching_shapes, read_inputs_axes};
 use fitscube_rs::combine::{CombineOptions, combine_fits};
 use fitscube_rs::error::FitsCubeError;
-use fitscube_rs::fits_io::update_key_f64;
+use fitscube_rs::fits_io::{delete_key, update_key_f64, update_key_i64, update_key_str};
+use fitscube_rs::specs::read_spec_from_header;
 use fitsio::FitsFile;
 use fitsio::images::{ImageDescription, ImageType};
 
@@ -870,4 +871,190 @@ fn scaled_integer_input_is_copied_losslessly() {
         let physical = 32768.0 + 2.0 * (chan as f64 * 1000.0 - 30000.0);
         assert!(all_eq(plane, physical), "channel {chan}: {:?}", &plane[..2]);
     }
+}
+
+fn edit(path: &Path, f: impl FnOnce(&mut FitsFile)) {
+    let mut fptr = FitsFile::edit(path.to_string_lossy().as_ref()).unwrap();
+    f(&mut fptr);
+}
+
+/// The frequency of the first pixel follows the FITS WCS rules for CRPIX, CD
+/// and CUNIT.
+#[test]
+fn header_frequency_follows_wcs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = make_plane(&dir.path().join("p.fits"), 1e9, Plane::default());
+    let freq = || read_spec_from_header(&path, false);
+    assert_eq!(freq().unwrap(), 1e9);
+
+    set_key(&path, "CRPIX4", 2.0);
+    assert_eq!(freq().unwrap(), 1e9 - 1e6);
+
+    // CRPIX defaults to 0
+    edit(&path, |f| delete_key(f, "CRPIX4").unwrap());
+    assert_eq!(freq().unwrap(), 1e9 + 1e6);
+
+    // CDi_i replaces CDELTi
+    edit(&path, |f| {
+        delete_key(f, "CDELT4").unwrap();
+        update_key_f64(f, "CRPIX4", 3.0).unwrap();
+        update_key_f64(f, "CD4_4", 5e5).unwrap();
+    });
+    assert_eq!(freq().unwrap(), 1e9 - 2.0 * 5e5);
+
+    edit(&path, |f| {
+        update_key_f64(f, "CRVAL4", 1000.0).unwrap();
+        update_key_f64(f, "CRPIX4", 1.0).unwrap();
+        update_key_str(f, "CUNIT4", "MHz").unwrap();
+    });
+    assert_eq!(freq().unwrap(), 1e9);
+
+    edit(&path, |f| update_key_str(f, "CUNIT4", "m/s").unwrap());
+    let err = freq().unwrap_err();
+    assert!(matches!(err, FitsCubeError::InvalidSpec(_)), "{err:?}");
+}
+
+/// A NaN frequency is refused instead of panicking in a sort.
+#[test]
+fn nan_spec_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    for create_blanks in [false, true] {
+        let opts = CombineOptions {
+            spec_list: Some(vec![1e9, f64::NAN, 3e9, 4e9]),
+            create_blanks,
+            ..options()
+        };
+        let err = combine_fits(&files, &out_cube, &opts).unwrap_err();
+        assert!(matches!(err, FitsCubeError::InvalidSpec(_)), "{err:?}");
+    }
+}
+
+fn int16_planes(dir: &Path) -> Vec<PathBuf> {
+    make_planes(dir, "int", &specs(), |i| Plane {
+        value: i as f64 * 10.0,
+        int16: true,
+        ..Default::default()
+    })
+}
+
+/// Stored integers under differing scales cannot share one integer cube, but
+/// decode to a float cube.
+#[test]
+fn differing_integer_scaling() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = int16_planes(dir.path());
+    for (i, path) in files.iter().enumerate() {
+        set_key(path, "BSCALE", 1.0 + i as f64);
+    }
+    let out_cube = dir.path().join("cube.fits");
+    let err = combine_fits(&files, &out_cube, &options()).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ScalingMismatch(_)), "{err:?}");
+    assert!(!out_cube.exists());
+
+    let opts = CombineOptions {
+        float_length: Some(32),
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    for (chan, plane) in read_planes(&out_cube).iter().enumerate() {
+        let value = chan as f64 * 10.0 * (1.0 + chan as f64);
+        assert!(all_eq(plane, value), "channel {chan}: {:?}", &plane[..2]);
+    }
+}
+
+/// An integer cube keeps the inputs' BLANK, and a float cube decodes BLANK
+/// pixels to NaN.
+#[test]
+fn integer_blank_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = int16_planes(dir.path());
+    for path in &files {
+        edit(path, |f| update_key_i64(f, "BLANK", 10).unwrap());
+    }
+    let out_cube = dir.path().join("cube.fits");
+    combine_fits(&files, &out_cube, &options()).unwrap();
+    assert_eq!(read_i64(&out_cube, "BLANK"), 10);
+    let planes = read_planes(&out_cube);
+    // cfitsio does not apply BLANK when reading as f64 without a null value
+    assert!(all_eq(&planes[1], 10.0));
+
+    let opts = CombineOptions {
+        float_length: Some(64),
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    let planes = read_planes(&out_cube);
+    assert!(all_eq(&planes[0], 0.0));
+    assert!(all_nan(&planes[1]));
+    assert!(all_eq(&planes[2], 20.0));
+
+    edit(&files[3], |f| update_key_i64(f, "BLANK", 11).unwrap());
+    let err = combine_fits(&files, &out_cube, &options()).unwrap_err();
+    assert!(matches!(err, FitsCubeError::ScalingMismatch(_)), "{err:?}");
+}
+
+/// A bad --floating is a usage error, not a panic.
+#[test]
+fn cli_rejects_bad_floating() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out = Command::new(env!("CARGO_BIN_EXE_fitscubers"))
+        .arg("combine")
+        .args(&files)
+        .arg(dir.path().join("cube.fits"))
+        .args(["--floating", "16"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("use 32 or 64"), "{stderr}");
+    fitscubers(&files, &dir.path().join("cube.fits"), &["--floating", "64"]);
+}
+
+/// One worker reads every plane without stalling the writer.
+#[test]
+fn single_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    let opts = CombineOptions {
+        max_workers: Some(1),
+        bounding_box: true,
+        ..options()
+    };
+    combine_fits(&files, &out_cube, &opts).unwrap();
+    for (chan, plane) in read_planes(&out_cube).iter().enumerate() {
+        assert!(all_eq(plane, chan as f64));
+    }
+}
+
+/// The CLI leaves an existing axis-values file alone without --overwrite.
+#[test]
+fn cli_keeps_specs_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    let specs_file = dir.path().join("cube.specs_Hz.txt");
+    std::fs::write(&specs_file, "keep\n").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_fitscubers"))
+        .arg("combine")
+        .args(&files)
+        .arg(&out_cube)
+        .output()
+        .unwrap()
+        .status;
+    assert!(!status.success());
+    assert!(!out_cube.exists());
+    assert_eq!(std::fs::read_to_string(&specs_file).unwrap(), "keep\n");
+
+    fitscubers(&files, &out_cube, &["--overwrite"]);
+    assert_eq!(
+        std::fs::read_to_string(&specs_file)
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
 }

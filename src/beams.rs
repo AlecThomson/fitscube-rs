@@ -62,14 +62,22 @@ pub fn parse_beams(file_list: &[PathBuf]) -> Result<Vec<Beam>> {
 ///
 /// `beams` holds one beam per input file, in output channel order; `missing`
 /// flags the blank channels of the output cube.
-pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Vec<Beam> {
+pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Result<Vec<Beam>> {
+    let populated = missing.iter().filter(|&&m| !m).count();
+    if populated != beams.len() {
+        return Err(FitsCubeError::ChannelMissing(format!(
+            "Have {} beams for the {populated} populated channels of {}",
+            beams.len(),
+            missing.len()
+        )));
+    }
     let nan = Beam {
         major_deg: f64::NAN,
         minor_deg: f64::NAN,
         pa_deg: f64::NAN,
     };
     let mut present = beams.iter();
-    let expanded: Vec<Beam> = missing
+    Ok(missing
         .iter()
         .map(|&m| {
             if m {
@@ -78,15 +86,7 @@ pub fn expand_beams(beams: &[Beam], missing: &[bool]) -> Vec<Beam> {
                 *present.next().unwrap_or(&nan)
             }
         })
-        .collect();
-    assert_eq!(
-        missing.iter().filter(|&&m| !m).count(),
-        beams.len(),
-        "Have {} beams for the populated channels of {}",
-        beams.len(),
-        missing.len()
-    );
-    expanded
+        .collect())
 }
 
 /// Channels whose restoring beam is exactly zero. Mirrors `find_zero_beams`.
@@ -231,6 +231,10 @@ pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32])
     let beam_hdu = fptr.hdu("BEAMS")?;
     beam_hdu.write_key(fptr, "NCHAN", nchan as i64)?;
     beam_hdu.write_key(fptr, "NPOL", stokes_idx.len() as i64)?;
+    // casacore reads the beam units from TUNITn
+    for (col, unit) in [(1, "arcsec"), (2, "arcsec"), (3, "deg")] {
+        beam_hdu.write_key(fptr, &format!("TUNIT{col}"), unit)?;
+    }
 
     Ok(())
 }
@@ -277,10 +281,17 @@ mod tests {
     #[test]
     fn expand_beams_blanks_missing_channels() {
         let beams = vec![b(1.0, 1.0, 0.0), b(2.0, 2.0, 0.0)];
-        let expanded = expand_beams(&beams, &[false, true, false]);
+        let expanded = expand_beams(&beams, &[false, true, false]).unwrap();
         assert_eq!(expanded[0], beams[0]);
         assert!(expanded[1].is_nan());
         assert_eq!(expanded[2], beams[1]);
+    }
+
+    #[test]
+    fn expand_beams_checks_count() {
+        let beams = vec![b(1.0, 1.0, 0.0)];
+        let err = expand_beams(&beams, &[false, true, false]).unwrap_err();
+        assert!(matches!(err, FitsCubeError::ChannelMissing(_)), "{err:?}");
     }
 
     #[test]
