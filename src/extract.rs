@@ -2,21 +2,22 @@
 //!
 //! Only the requested plane is read. The output keeps the cube's axes, with the
 //! FREQ/TIME axis of length 1, and takes its beam from the `BEAMS` table.
-use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
+use atfits_rs::raw::{Pixel, disable_scaling, read_pixels, write_pixels};
 use atfits_rs::{
-    HeaderGeom, TargetAxis, delete_key, key_string, resize_image, update_key_f64, update_key_i64,
+    HeaderGeom, TargetAxis, copy_hdu_header, delete_key, key_bool, resize_image, update_key_f64,
+    update_key_i64,
 };
 use fitsio::errors::check_status;
-use fitsio::{FileOpenMode, FitsFile, sys};
+use fitsio::{FitsFile, sys};
 use rayon::prelude::*;
 
 use crate::beams::{Beam, read_beam_table};
 use crate::combine::{check_exists, in_pool};
 use crate::error::{FitsCubeError, Result};
 use crate::partial::PartialFile;
-use crate::pixels::{Pixel, disable_scaling, read_pixels, with_pixel_type, write_pixels};
+use crate::pixels::with_pixel_type;
 use crate::wcs::{find_axis, world};
 
 /// Which plane of which HDU to extract, and where to.
@@ -162,10 +163,7 @@ impl Cube {
         let axis = find_axis(&mut fptr, axis_name)?.ok_or_else(|| {
             FitsCubeError::TargetAxisMissing(format!("Did not find the {axis_name} axis"))
         })?;
-        let casambm = matches!(
-            key_string(&mut fptr, "CASAMBM")?.as_deref().map(str::trim),
-            Some("T" | "TRUE" | "True" | "true")
-        );
+        let casambm = key_bool(&mut fptr, "CASAMBM")?.unwrap_or(false);
         let beams = if casambm {
             let beams = read_beam_table(&mut fptr)?;
             if beams.is_none() {
@@ -252,9 +250,9 @@ fn copy_plane<T: Pixel>(
     let mut plane: Vec<T> = Vec::new();
     // Stored values are copied as they are, under the cube's BSCALE and BZERO
     disable_scaling(src)?;
-    read_pixels(src, &cube.geom.dims, Some(&ranges), None, &mut plane)?;
+    read_pixels(src, Some(&ranges), None, &mut plane)?;
 
-    let mut out = create_with_header(src, path)?;
+    let mut out = copy_hdu_header(src, path)?;
     let mut dims = cube.geom.dims.clone();
     dims[fi - 1] = 1;
     resize_image(&mut out, cube.geom.bitpix, &dims)?;
@@ -268,37 +266,13 @@ fn copy_plane<T: Pixel>(
     if cube.casambm {
         delete_key(&mut out, "CASAMBM")?;
     }
-    for key in ["CHECKSUM", "DATASUM"] {
-        delete_key(&mut out, key)?;
-    }
     disable_scaling(&mut out)?;
-    write_pixels(&mut out, &plane)?;
+    write_pixels(&mut out, 0, &plane)?;
     let mut status = 0;
     // SAFETY: `out` is open; flushing reports write errors that close hides.
     unsafe { sys::ffflus(out.as_raw(), &mut status) };
     check_status(status)?;
     Ok(())
-}
-
-/// A new file at `path` (replacing it) holding the header of the current HDU
-/// of `src` as its primary header, with no data written yet.
-fn create_with_header(src: &mut FitsFile, path: &Path) -> Result<FitsFile> {
-    let name = CString::new(format!("!{}", path.display()))
-        .map_err(|e| FitsCubeError::Atfits(e.to_string()))?;
-    let mut raw = std::ptr::null_mut();
-    let mut status = 0;
-    // SAFETY: `name` is a valid C string and `raw` receives the new handle,
-    // which `FitsFile::from_raw` then owns.
-    unsafe {
-        sys::ffinit(&mut raw, name.as_ptr(), &mut status);
-        check_status(status)?;
-        let mut out = FitsFile::from_raw(raw, FileOpenMode::READWRITE)?;
-        // Converts an image extension header to a primary one
-        sys::ffcphd(src.as_raw(), out.as_raw(), &mut status);
-        check_status(status)?;
-        out.primary_hdu()?;
-        Ok(out)
-    }
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

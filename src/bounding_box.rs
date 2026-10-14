@@ -4,13 +4,13 @@
 //! column (numpy axis 1, FITS NAXIS1).
 use std::path::{Path, PathBuf};
 
+use atfits_rs::raw::{Pixel, read_pixels};
 use fitsio::FitsFile;
 use ndarray::ArrayView2;
 use num_traits::Float;
 use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
-use crate::pixels::{Pixel, read_pixels};
 
 /// Pixel bounds of the finite data of a plane. Maxima are exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,22 +99,21 @@ pub fn get_bounding_box_for_fits(
         )));
     };
     if bitpix == -64 {
-        plane_box::<f64>(&mut fptr, &dims, (nrows, ncols), bitpix, invalidate_zeros)
+        plane_box::<f64>(&mut fptr, (nrows, ncols), bitpix, invalidate_zeros)
     } else {
-        plane_box::<f32>(&mut fptr, &dims, (nrows, ncols), bitpix, invalidate_zeros)
+        plane_box::<f32>(&mut fptr, (nrows, ncols), bitpix, invalidate_zeros)
     }
 }
 
 fn plane_box<T: Pixel + Float>(
     fptr: &mut FitsFile,
-    dims: &[usize],
     shape: (usize, usize),
     bitpix: i64,
     invalidate_zeros: bool,
 ) -> Result<Option<BoundingBox>> {
     let mut data = Vec::new();
     // BLANK pixels of an integer image are not data
-    read_pixels(fptr, dims, None, (bitpix > 0).then(T::nan), &mut data)?;
+    read_pixels(fptr, None, (bitpix > 0).then(T::nan), &mut data)?;
     if invalidate_zeros {
         for v in data.iter_mut().filter(|v| v.is_zero()) {
             *v = T::nan();

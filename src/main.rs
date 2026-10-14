@@ -50,7 +50,7 @@ struct CombineArgs {
     /// Frequencies (Hz) or times (MJD s) given on the command line.
     #[arg(long, num_args = 1.., group = "spec")]
     specs: Option<Vec<f64>>,
-    /// Ignore frequency/time information and just stack.
+    /// Ignore frequency/time information and stack in the given order.
     #[arg(long, group = "spec")]
     ignore_spec: bool,
     /// Increase output verbosity (repeatable).

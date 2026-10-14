@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::sync_channel;
 
+use atfits_rs::raw::{Pixel, as_bytes, disable_scaling, read_pixels, swap_to_be};
 use atfits_rs::{
     CubeLayout, create_mem_cube, delete_key, extract_header_layout, key_f64, update_key_f64,
     update_key_i64, update_key_logical, update_key_str, write_comment,
@@ -25,7 +26,7 @@ use crate::checks::{
 };
 use crate::error::{FitsCubeError, Result};
 use crate::partial::PartialFile;
-use crate::pixels::{Pixel, as_bytes, bbox_ranges, disable_scaling, read_pixels, swap_to_be};
+use crate::pixels::bbox_ranges;
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
 
@@ -537,17 +538,10 @@ impl PlaneSource<'_> {
             return Ok(());
         };
         let mut fptr = self.open(i)?;
-        let header = &self.headers[i];
         // Only integer images need BLANK mapped; NaN checks slow float reads
-        let s = header.storage;
+        let s = self.headers[i].storage;
         let nulval = (s.bitpix > 0 && s.blank.is_some()).then(T::nan);
-        read_pixels(
-            &mut fptr,
-            &header.dims,
-            self.ranges(i).as_deref(),
-            nulval,
-            buf,
-        )?;
+        read_pixels(&mut fptr, self.ranges(i).as_deref(), nulval, buf)?;
         if self.invalidate_zeros {
             for v in buf.iter_mut().filter(|v| v.is_zero()) {
                 *v = T::nan();
@@ -562,8 +556,8 @@ impl PlaneSource<'_> {
             .ok_or_else(|| FitsCubeError::ChannelMissing(format!("no input for channel {chan}")))?;
         let mut fptr = self.open(i)?;
         disable_scaling(&mut fptr)?;
-        let dims = &self.headers[i].dims;
-        read_pixels(&mut fptr, dims, self.ranges(i).as_deref(), None, buf)
+        read_pixels(&mut fptr, self.ranges(i).as_deref(), None, buf)?;
+        Ok(())
     }
 }
 
