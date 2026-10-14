@@ -1,7 +1,5 @@
-//! Python bindings (`fitscube_rs._fitscube_rs`).
-//!
-//! Thin wrappers over [`crate::combine`] and [`crate::extract`]; all the FITS
-//! work happens in Rust against file paths.
+//! Python bindings (`fitscube_rs._fitscube_rs`) over [`crate::combine`] and
+//! [`crate::extract`].
 use std::path::PathBuf;
 
 use pyo3::exceptions::{
@@ -116,13 +114,13 @@ impl PyBoundingBox {
         self.0.original_shape
     }
 
-    /// The span between ymax and ymin (i.e. the trimmed NAXIS1).
+    /// ``ymax - ymin``, the trimmed NAXIS1.
     #[getter]
     fn y_span(&self) -> usize {
         self.0.y_span
     }
 
-    /// The span between xmax and xmin (i.e. the trimmed NAXIS2).
+    /// ``xmax - xmin``, the trimmed NAXIS2.
     #[getter]
     fn x_span(&self) -> usize {
         self.0.x_span
@@ -152,13 +150,11 @@ impl pyo3_stub_gen::PyStubType for BoundingBoxArg {
     }
 }
 
-/// Compute the single bounding box that encompasses the valid data of every
-/// image in ``file_list``.
+/// The smallest box holding the finite pixels of every image in ``file_list``.
 ///
-/// This is the box ``combine_fits`` computes internally when
-/// ``bounding_box=True``. Compute it once with this function and pass the
-/// result to ``combine_fits(bounding_box=...)`` when several cubes (e.g. an
-/// image cube and its weights cube) must land on an identical pixel grid.
+/// This is the box ``combine_fits(bounding_box=True)`` uses. Pass it as
+/// ``combine_fits(bounding_box=box)`` to put several cubes, such as an image
+/// cube and its weights, on the same pixel grid.
 ///
 /// Args:
 ///     file_list (list[str]): The FITS images to consider.
@@ -273,7 +269,6 @@ fn combine_fits(
         supplied_bounding_box,
         invalidate_zeros,
         float_length,
-        // No stderr progress bars when driven from Python.
         progress: false,
         blank_zero_beams,
     };

@@ -51,12 +51,12 @@ class BoundingBox:
     @property
     def y_span(self) -> builtins.int:
         r"""
-        The span between ymax and ymin (i.e. the trimmed NAXIS1).
+        ``ymax - ymin``, the trimmed NAXIS1.
         """
     @property
     def x_span(self) -> builtins.int:
         r"""
-        The span between xmax and xmin (i.e. the trimmed NAXIS2).
+        ``xmax - xmin``, the trimmed NAXIS2.
         """
     def __eq__(self, other: builtins.object, /) -> builtins.bool: ...
     def __new__(cls, xmin: builtins.int, xmax: builtins.int, ymin: builtins.int, ymax: builtins.int, original_shape: tuple[builtins.int, builtins.int]) -> BoundingBox:
@@ -164,13 +164,11 @@ def extract_planes_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Pat
 
 def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], invalidate_zeros: builtins.bool = False) -> BoundingBox:
     r"""
-    Compute the single bounding box that encompasses the valid data of every
-    image in ``file_list``.
+    The smallest box holding the finite pixels of every image in ``file_list``.
     
-    This is the box ``combine_fits`` computes internally when
-    ``bounding_box=True``. Compute it once with this function and pass the
-    result to ``combine_fits(bounding_box=...)`` when several cubes (e.g. an
-    image cube and its weights cube) must land on an identical pixel grid.
+    This is the box ``combine_fits(bounding_box=True)`` uses. Pass it as
+    ``combine_fits(bounding_box=box)`` to put several cubes, such as an image
+    cube and its weights, on the same pixel grid.
     
     Args:
         file_list (list[str]): The FITS images to consider.

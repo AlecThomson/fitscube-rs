@@ -1,9 +1,8 @@
 # Performance
 
-`fitscube-rs` is a drop-in replacement for the original Python
-[`fitscube`](https://github.com/AlecThomson/fitscube) that produces
-**bit-for-bit identical cubes** (the parity test suite asserts this) while
-running faster across the board.
+`fitscube-rs` writes the same cubes as
+[`fitscube`](https://github.com/AlecThomson/fitscube) (the parity tests compare
+data, axis cards and beam tables) and is faster on every case measured.
 
 ## Benchmark
 
@@ -37,22 +36,37 @@ Hardware: Apple M4 Pro (12 cores). `fitscube` 2.3.1, `astropy` 8.0.0,
 
 ## Why it's faster
 
-- **No per-image Python/`astropy` overhead.** Header parsing, WCS handling,
-  and frequency-axis construction run in compiled Rust. The win is largest for
-  workloads with **many small images**, where this fixed per-image cost
-  dominates — hence 2.2× at 50 × 128² shrinking toward parity as raw pixel I/O
-  takes over.
-- **Streamed, single-pass writes.** The output cube's header is built in memory
-  and written once; the data unit is laid down plane-by-plane with raw I/O over
-  a sparse file, avoiding cfitsio's redundant zero-fill pass.
-- **Parallelism.** Per-channel work (header reads, plane copies, beam-table
-  assembly) is fanned out across cores with `rayon`.
+- **No per-image Python overhead.** Headers, WCS and the frequency axis are
+  handled in Rust. This matters most for many small images, hence 2.2x at
+  50 x 128² shrinking towards parity as pixel I/O takes over.
+- **One header read per input.** All the header cards combine needs are read
+  in one parallel pass, one open per file.
+- **Less pixel copying.** Each plane is read straight into its output type,
+  byte-swapped in place and written with positional writes into a sparse file,
+  so the data unit is written once. With `--bounding-box` only the box is read.
+- **Parallel reads.** Planes are read and swapped on `rayon` threads
+  (`--max-workers` of them) while one thread writes.
+- **`extract` reads one plane**, not the whole cube.
+
+### Against the previous release
+
+200 x 1024² float32 images (800 MB cube), 4 cores, median of 4 runs, the CLI
+before and after the single header pass and plane-read changes. Combine ran on
+tmpfs; extract on disk with a warm cache.
+
+| Command                         | Before | After  |
+| ------------------------------- | -----: | -----: |
+| `combine`                       | 0.73 s | 0.44 s |
+| `combine --bounding-box`        | 1.40 s | 0.80 s |
+| `extract --channel-index 100`   | 2.6 s  | 0.02 s |
+
+Overwriting an existing cube adds the time to delete the old one, since the
+new cube is written beside it and renamed into place.
 
 ## Memory
 
-`fitscube-rs` streams: only a small number of channel planes are resident at
-once, never the whole cube. Peak memory is roughly *one plane × in-flight count*
-plus the header, independent of channel count.
+`fitscube-rs` streams: at most about three planes per reader thread are in
+memory, never the whole cube, whatever the channel count.
 
 Peak resident memory (max RSS), combine-only, inputs generated in a separate
 process so only the combine is measured:
@@ -65,22 +79,17 @@ process so only the combine is measured:
 The native CLI uses the least memory and is stable run-to-run. The
 `fitscube-rs` Python binding pays the interpreter's baseline on top of the
 streaming core, so it wins at small/medium cubes and roughly ties `fitscube` at
-large ones — use the CLI when footprint matters.
-
-(An earlier `fitscube-rs` build allocated a cube-sized buffer in RAM while
-assembling the header — peaking at the full cube size — which has since been
-fixed; the numbers above are post-fix.)
+large ones. Use the CLI when memory matters.
 
 ### Larger than memory
 
-Both tools stream, so neither needs to hold the whole cube — but *how* they
-write the data unit differs, and it matters once the cube exceeds RAM.
+Both tools stream, but they write the data unit differently, which matters
+once the cube exceeds RAM.
 `fitscube` memmaps the output and writes through the mapping, which dirties the
 entire output in memory; the peak *footprint* (dirty + anonymous pages) grows to
 the full cube size. `fitscube-rs` writes each plane with positional
-`write_all_at`, so written pages are flushed and reclaimed rather than charged
-to the process — its footprint stays bounded by the in-flight planes regardless
-of cube size.
+writes, so written pages are flushed and reclaimed rather than charged to the
+process, and its footprint stays bounded by the planes in flight.
 
 Combine of a **26 GB cube on a 24 GB-RAM machine** (420 × 4096², float32),
 combine-only:
@@ -89,25 +98,25 @@ combine-only:
 | --------------------------------- | -----: | -------------: | ------: |
 | `fitscube` (py)                   |  78 s  |     **23.5 GB**|  1.6 GB |
 | `fitscube-rs` (CLI, default)      |  19 s  |       2.6 GB   |  2.6 GB |
-| `fitscube-rs` (CLI, max-workers 4)|  16 s  |     **1.2 GB** |    —    |
+| `fitscube-rs` (CLI, max-workers 4)|  16 s  |     **1.2 GB** |    -    |
 
-Once the cube exceeds RAM, `fitscube`'s footprint hits the memory ceiling and it
-thrashes — ~4–5× slower here, and it would OOM outright on a cube comfortably
-larger than RAM. `fitscube-rs` is unaffected: its footprint is set by *plane
-size × in-flight count*, tunable with `--max-workers` (the default over-buffers
-for very large planes; `--max-workers 4` was both lighter and faster above).
+Once the cube exceeds RAM, `fitscube`'s footprint reaches the memory ceiling
+and it thrashes: 4 to 5 times slower here, and it would run out of memory on a
+cube well beyond RAM. The footprint of `fitscube-rs` is set by plane size and
+the number of reader threads, which `--max-workers` limits. (These figures
+predate `--max-workers` setting the thread count; it then only limited the
+plane queue.)
 
 ## What it does *not* claim
 
-- **Huge single-plane cubes (time).** Once a job is bound by raw pixel write
-  throughput (large image dimensions, few channels), both implementations
-  converge on `cfitsio`/`numpy` I/O and the speedup narrows to ~1.5×.
+- **Large planes.** When a job is bound by pixel write throughput (large
+  images, few channels), both tools are limited by the same I/O and the
+  speedup narrows.
 
 ## Caveats
 
-- Times are best-of-3 with a warm page cache; absolute numbers vary with
-  hardware, disk, and thread count. The **relative** ordering and the
-  many-images-favor-Rust trend are stable.
+- Times are best of 3 with a warm page cache, and vary with hardware, disk and
+  thread count. The ordering and the many-small-images trend hold.
 - The benchmark uses synthetic Gaussian-noise images with minimal headers.
-  Real data with rich headers and per-channel beams increases the per-image
-  parsing cost, which favors `fitscube-rs` further.
+  Real headers with per-channel beams cost more to parse per image, which
+  favours `fitscube-rs` further.

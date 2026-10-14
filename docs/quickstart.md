@@ -7,14 +7,12 @@ kernelspec:
 
 # Python quickstart
 
-This page is an executable notebook: every cell below is re-run on each docs
-build, so the outputs are guaranteed to match the current release.
+The cells on this page run on every docs build.
 
 ## Building a set of single-channel images
 
-fitscube-rs combines many single-frequency (or single-time) FITS images into a
-single FITS cube. To demonstrate, we first write out a handful of synthetic
-single-channel images, each with its own frequency in the header.
+First, some synthetic single-channel images, each with its own frequency and
+restoring beam in the header.
 
 ```{code-cell} ipython3
 import tempfile
@@ -35,6 +33,8 @@ for i, freq in enumerate(freqs_hz):
     header["CRVAL3"] = freq
     header["CTYPE3"] = "FREQ"
     header["CUNIT3"] = "Hz"
+    header["BMAJ"] = header["BMIN"] = (10 + i) / 3600  # degrees
+    header["BPA"] = 0.0
     path = workdir / f"chan_{i:04d}.fits"
     fits.writeto(path, data[np.newaxis, :, :], header, overwrite=True)
     paths.append(path)
@@ -44,9 +44,8 @@ sorted(p.name for p in paths)
 
 ## Combining images into a cube
 
-{func}`~fitscube_rs.combine_fits` stacks the per-channel images along a new
-spectral (or time) axis, building the WCS for that axis from the per-image
-headers. The resulting cube is written to disk:
+{func}`~fitscube_rs.combine_fits` stacks the images along their frequency axis
+and returns the frequencies:
 
 ```{code-cell} ipython3
 from fitscube_rs import combine_fits
@@ -63,16 +62,15 @@ with fits.open(out_cube) as hdul:
     print("frequencies (Hz):", freqs)
 ```
 
-The frequency axis is detected as evenly spaced, so the cube header carries a
-linear `CRVAL3`/`CDELT3` description. When the spacing is uneven, fitscube-rs
-instead writes an explicit per-plane frequency table so no information is lost
-(see [Algorithm background](algorithms.md)).
+The frequencies are evenly spaced, so the header describes them with `CRVAL3`
+and `CDELT3`. Unevenly spaced frequencies give a plain channel axis instead
+(see [Algorithm background](algorithms.md)), and the returned list is then the
+only record of them.
 
 ## Extracting a plane
 
-{func}`~fitscube_rs.extract_plane_from_cube` pulls a single plane back out of a
-cube — the inverse of combining — which is handy for inspecting one channel or
-feeding a downstream tool that expects a 2D image:
+{func}`~fitscube_rs.extract_plane_from_cube` pulls one plane back out, with
+its own frequency and beam in the header:
 
 ```{code-cell} ipython3
 from fitscube_rs import extract_plane_from_cube
@@ -85,28 +83,27 @@ extract_plane_from_cube(
 with fits.open(plane_path) as hdul:
     print("plane shape:", hdul[0].data.shape)
     print("plane value:", float(np.nanmean(hdul[0].data)))
+    print("frequency (Hz):", hdul[0].header["CRVAL3"])
+    print("BMAJ (arcsec):", hdul[0].header["BMAJ"] * 3600)
 ```
 
 ## Per-channel beams
 
-Radio images often carry a restoring beam (`BMAJ`/`BMIN`/`BPA`) that varies
-from channel to channel. When the input images have differing beams, the
-combined cube records them in a CASA-style `BEAMS` binary-table extension and
-sets `CASAMBM=T` in the primary header, matching the convention used by
-`astropy` and CASA:
+The beams differ from channel to channel, so the cube keeps them in a CASA
+`BEAMS` table and sets `CASAMBM = T`:
 
 ```{code-cell} ipython3
+from astropy.table import Table
+
 with fits.open(out_cube) as hdul:
-    has_beams = any(h.name == "BEAMS" for h in hdul)
-    print("primary HDUs:", [h.name or "PRIMARY" for h in hdul])
-    print("multi-beam table present:", has_beams)
+    print([h.name for h in hdul])
+    print("CASAMBM:", hdul[0].header["CASAMBM"])
+    print(Table.read(hdul["BEAMS"]))
 ```
 
 ## Working with the CLI
 
-For batch jobs (hundreds of channels, large mosaics) prefer the
-[`fitscubers` CLI](cli.md) — it parallelises the read/stack across workers and
-streams planes to disk so peak memory stays bounded:
+The same from the shell, with the [`fitscubers` CLI](cli.md):
 
 ```sh
 fitscubers combine chan_*.fits cube.fits --overwrite

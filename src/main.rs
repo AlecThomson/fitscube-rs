@@ -1,8 +1,4 @@
-//! `fitscubers` command-line interface.
-//!
-//! Two subcommands mirror the original package:
-//! * `fitscubers combine` — combine single-plane images into a cube.
-//! * `fitscubers extract` — extract one plane from a cube.
+//! The `fitscubers` CLI: `combine` images into a cube, or `extract` a plane.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -157,7 +153,6 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         invalidate_zeros: args.invalidate_zeros,
         float_length: args.floating,
         blank_zero_beams: !args.no_blank_zero_beams,
-        // CLI: show progress bars on stderr.
         progress: true,
     };
 
@@ -171,7 +166,6 @@ fn run_combine(args: CombineArgs) -> Result<()> {
     };
     info!("Written cube to {}", out_cube.display());
 
-    // Write the axis values alongside the cube, as the original CLI does.
     let body: String = specs.iter().map(|v| format!("{v}\n")).collect::<String>();
     std::fs::write(&specs_file, body)
         .with_context(|| format!("writing spec values to {}", specs_file.display()))?;

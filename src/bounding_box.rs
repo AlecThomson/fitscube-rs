@@ -81,6 +81,7 @@ pub fn get_bounding_box_for_fits(
     path: &Path,
     invalidate_zeros: bool,
 ) -> Result<Option<BoundingBox>> {
+    crate::combine::check_exists(path)?;
     let mut fptr = FitsFile::open(path)?;
     let hdu = fptr.primary_hdu()?;
     let (dims, bitpix): (Vec<usize>, i64) = match &hdu.info {

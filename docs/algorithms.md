@@ -1,128 +1,118 @@
 # Algorithm background
 
-This page summarises what fitscube-rs does when it combines a set of
-single-plane FITS images into a cube and when it extracts a plane back out. It
-is a Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube)
-Python package and follows the same conventions, so cubes produced by either
+What fitscube-rs does when it combines single-plane FITS images into a cube,
+and when it extracts planes back out. It follows the conventions of
+[`fitscube`](https://github.com/AlecThomson/fitscube), so cubes from either
 tool are interchangeable.
 
 ## Combining images into a cube
 
-The input is a list of FITS images, each holding a single plane: one frequency
-channel (the default) or one time step (`--time-domain`). fitscube-rs reads the
-2D data from each image and stacks them along a new leading axis, producing a
-3D (or 4D, with a degenerate Stokes axis preserved) cube whose plane order
-follows the order the files are given.
+The input is a list of FITS images, each holding one frequency channel (the
+default) or one time step (`--time-domain`). The planes are sorted by
+frequency or time and stacked along that axis. A 2D input gains a third axis;
+an input that already has a FREQ (or TIME) axis is stacked along it.
+`--ignore-spec` keeps the input order instead.
 
-Before any output is written, every input header is checked against the first:
+Every input header is checked against the first before anything is written:
 the same pixel grid (`NAXIS1`/`NAXIS2`), the same axes in the same order (the
-`CTYPE` of every axis), and the same Stokes parameter. The cube is labelled from
-the first image, so an input that differs is an error rather than a silently
-mislabelled or scrambled plane. Each input may carry several planes of its own
-(e.g. a Stokes axis) as long as they sit below the combine axis: the
-frequency/time axis must be the slowest-varying axis of the cube, since each
-channel is written at a fixed offset. The spatial WCS
-(`CRVAL1/2`, `CDELT1/2`, projection, …) is taken from the first image and
-carried onto the cube unchanged.
+`CTYPE` of every axis) and the same Stokes parameter. The cube header is copied
+from the first image, so a differing input is an error rather than a
+mislabelled plane. An input may hold several planes of its own (a Stokes axis,
+say) as long as they sit below the combine axis: each channel is written at a
+fixed offset, so the frequency or time axis must vary slowest.
 
-## Frequency vs time domain
+The cube is written to a hidden file next to the output and renamed into
+place at the end, so a failed combine leaves no partial cube.
 
-The new axis can be either spectral or temporal:
+## Frequency and time
 
-- **Frequency** (default): the per-plane coordinate is the spectral value of
-  each image, read from its spectral WCS axis (`CTYPE`/`CRVAL`/`CUNIT`) or
-  supplied explicitly. The cube gains a `FREQ` axis.
-- **Time** (`--time-domain`): the per-plane coordinate is a time stamp and the
-  cube gains a time axis instead.
+- **Frequency** (default): a 2D image gives its frequency in `REFFREQ`. An
+  image with a `FREQ` axis gives the frequency of its first pixel along that
+  axis, from `CRVAL`, `CRPIX` and `CDELT` (or `CDi_i`, or `CDELTi * PCi_i`),
+  with the FITS defaults for missing cards. `CUNIT` may be Hz, kHz, MHz or GHz;
+  other units are an error. The cube gets a `FREQ` axis in Hz.
+- **Time** (`--time-domain`): each image's `DATE-OBS`, as MJD seconds. The cube
+  gets a `TIME` axis in seconds.
 
-In both cases the per-plane coordinates may be provided out-of-band via a
-spec file (`--spec-file`) or an inline list (`--specs`), which overrides what
-is read from the headers; `--ignore-spec` skips reading the coordinate
-entirely and writes a bare pixel axis.
+`--spec-file` (one value per line) or `--specs` supply the values instead of
+the headers. NaN or infinite values are an error.
 
-## Even vs uneven spacing detection
+## Even and uneven spacing
 
-After collecting the per-plane coordinates, fitscube-rs decides how to describe
-the new axis in the output WCS:
+- **Evenly spaced** values (standard deviation of the steps below 1e-4, or for
+  time a running drift under 2% of the mean step) become a linear axis:
+  `CRVAL` is the first value and `CDELT` the median step.
+- **Uneven** values cannot be described by one `CDELT`. The axis is written as
+  `CTYPE = CHAN`, `CRVAL = 1`, `CDELT = 1` with a warning, so the header no
+  longer records the frequencies or times. `combine_fits` returns them, and the
+  CLI writes them to `OUT_CUBE.specs_Hz.txt` (or `.specs_s.txt`).
 
-- **Evenly spaced**: if successive coordinates differ by a constant step (within
-  a small tolerance), the axis is written as a linear WCS — a single reference
-  value (`CRVALn`) and increment (`CDELTn`). This is the compact, standard form
-  most downstream tools expect.
-- **Unevenly spaced**: if the step varies, no single `CDELT` can describe the
-  axis without losing information. fitscube-rs instead writes the full list of
-  per-plane coordinates as an explicit table alongside the cube, so the exact
-  frequency (or time) of every plane is recoverable. The user is warned that
-  the axis is non-linear.
-
-With `--create-blanks`, fitscube-rs instead builds a regular grid through the
-inputs (sorted first, with the step recovered as the greatest common divisor of
-the gaps) and fills the grid points without an input with blank (NaN) planes.
-If some input would not land on a grid point — an irregular spacing with no
-common step, or two inputs at the same frequency — the combine is refused
-rather than silently dropping that input.
+With `--create-blanks`, fitscube-rs builds a regular grid through the sorted
+values instead, with the step taken as the greatest common divisor of the gaps,
+and fills the grid points that have no input with NaN planes. The combine is
+refused if an input would fall between grid points, if two inputs share one,
+or if the grid would need more than 1000 channels per input.
 
 ## Per-channel beams (`BEAMS` table)
 
-Radio images frequently carry a restoring beam (`BMAJ`, `BMIN`, `BPA`) that
-differs from plane to plane. fitscube-rs preserves this:
+Radio images often carry a restoring beam (`BMAJ`, `BMIN`, `BPA`) that changes
+from plane to plane.
 
-- If all input planes share one beam, the single `BMAJ`/`BMIN`/`BPA` is written
-  to the primary header.
-- Beams follow the planes: they are sorted with them, and blank channels get a
-  NaN beam. Any input with a beam counts, not just the first.
-- If the beams differ across planes, fitscube-rs writes a CASA-style `BEAMS`
-  binary-table extension — one row per plane with that plane's beam and its
-  `CHAN`/`POL`, which are 0-based indices into the cube's frequency (or time)
-  and Stokes axes, not FITS Stokes codes — and sets `CASAMBM=T` in the primary header. This is
-  the multi-beam convention understood by CASA and `astropy`, so per-channel
-  beam information survives the round trip into the cube. Only single-Stokes
-  cubes are supported (`POL = 0`, `NPOL = 1`); a multi-Stokes cube with
-  varying beams is refused before any data are written.
-- A NaN beam is stored as `numpy.finfo(float32).tiny`, the sentinel CASA
-  expects, and so is an exactly-zero beam, which is not a valid PSF.
+- If every input has the same beam, it stays in the primary header.
+- Otherwise fitscube-rs appends a CASA `BEAMS` binary table with one row per
+  channel: `BMAJ` and `BMIN` in arcsec, `BPA` in degrees, and `CHAN`/`POL`,
+  0-based indices into the cube's frequency and Stokes axes. It sets
+  `CASAMBM = T` and removes the single-beam cards. Only single-Stokes cubes are
+  supported; a multi-Stokes cube with varying beams is refused before any data
+  are written.
+- Beams follow the planes when they are sorted, and blank channels get a NaN
+  beam. Any input with a beam counts, not just the first.
+- CASA cannot read NaN, so a NaN beam is stored as `numpy.finfo(float32).tiny`,
+  as is a beam with a zero axis.
 
 ### Zero beams
 
-wsclean writes `BMAJ = BMIN = 0` into an image when no PSF was fitted for that
-plane. With `-fit-spectral-pol` the channels that were not imaged directly are
-filled with the model image instead, which looks like data but is not
-comparable to the rest of the cube. By default such planes are blanked with
-NaNs (with a warning naming the channels); `--no-blank-zero-beams`
-(`blank_zero_beams=False`) keeps their data.
+wsclean writes `BMAJ = BMIN = 0` for a plane with no fitted PSF. With
+`-fit-spectral-pol`, channels that were not imaged hold the model image, which
+looks like data but is not comparable to the rest of the cube. By default these
+planes are blanked with NaN, with a warning naming the channels;
+`--no-blank-zero-beams` (`blank_zero_beams=False`) keeps them.
 
 ## Bounding-box trimming
 
-With `--bounding-box`, fitscube-rs trims away the blank border shared by every
-plane. It computes, across all input planes, the smallest rectangle that
-contains all the valid (non-blank) pixels, then crops every plane to that
-common box and updates the spatial reference pixel (`CRPIX1/2`) so the WCS stays
-correct. This shrinks cubes that were padded out to a large common canvas
-without discarding any real data. `--invalidate-zeros` first treats exact-zero
-pixels as blank, so zero-padded borders are trimmed too.
+`--bounding-box` finds the smallest rectangle holding every finite pixel of
+every input, crops all planes to it, and shifts `CRPIX1/2` to match.
+`--invalidate-zeros` treats exact zeros as blank, so zero-padded borders are
+trimmed too.
 
 From Python, compute the box once with `get_common_bounding_box` and pass it as
-`combine_fits(..., bounding_box=box)` to trim several cubes — e.g. an image
-cube and its weights cube — to an identical pixel grid.
+`combine_fits(..., bounding_box=box)` to put several cubes (an image cube and
+its weights, say) on the same pixel grid.
 
-## Floating-point precision
+## Precision
 
-`--floating {32,64}` selects the pixel data type of the output cube
-(`float32` / BITPIX −32, or `float64` / BITPIX −64). These are the only IEEE
-float widths the FITS standard defines, so other values are rejected. The
-default follows the inputs; downcasting to `float32` is offered for cubes where
-storage matters more than the last bits of precision.
+`--floating {32,64}` sets the output to float32 (BITPIX -32) or float64
+(BITPIX -64), the only float widths FITS defines. By default the cube keeps
+the input BITPIX.
 
-Integer inputs are copied as integers at their own BITPIX, keeping any
-`BSCALE`/`BZERO`. Blank planes (from `--create-blanks` or zero beams) and
-`--invalidate-zeros` are written as NaNs, which an integer cube cannot hold, so
-those need `--floating 32` or `--floating 64`.
+An integer cube copies the stored integers, so every input must share BITPIX,
+`BSCALE`, `BZERO` and `BLANK`, which the cube keeps. Blank channels and
+`--invalidate-zeros` produce NaN, which an integer cube cannot hold, so they
+need `--floating`. A float cube made from integer inputs decodes them, with
+`BLANK` pixels as NaN.
 
 ## Plane extraction
 
-`extract` is the inverse operation. Given a cube and a plane selector
-(`--channel-index` for spectral cubes, `--time-index` for time cubes), it reads
-that single plane, rebuilds a 2D image header from the cube WCS (dropping the
-combined axis and restoring the per-plane coordinate and beam where available),
-and writes a standalone FITS image. `--hdu-index` selects which HDU of the cube
-to read from when it is not the primary.
+`extract` reads one plane of a cube (`--channel-index` or `--time-index`) and
+writes it as an image with the same axes, the extracted axis now of length 1.
+That axis gets `CRPIX = 1` and the plane's own `CRVAL`. Stored values are
+copied as they are, so integer cubes extract exactly. If the cube has a
+`BEAMS` table, the plane's beam goes into `BMAJ`/`BMIN`/`BPA` and `CASAMBM` is
+removed. `--hdu-index` picks the HDU, which may be an image extension.
+
+`extract_planes_from_cube` (Python and Rust) writes every channel to its own
+file, reading the beam table once.
+
+fitscube computes the extracted `CRVAL` as `CRVAL + index * CDELT`, ignoring
+`CRPIX`; fitscube-rs uses `CRPIX`, so the two differ for cubes whose `CRPIX`
+on that axis is not 1.

@@ -5,6 +5,7 @@ name = "fitscube-rs"
 # wheel/sdist version follows automatically.
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Alec Thomson"]
 license = "BSD-3-Clause"
 description = "Combine single-frequency/single-time FITS images into a FITS cube (Rust port of fitscube)"

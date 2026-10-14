@@ -1,7 +1,5 @@
-//! Regression tests for the cube-scrambling, blank-channel and beam bugs.
-//!
-//! Port of `tests/test_combine_guards.py`, `tests/test_zero_beams.py` and the
-//! beam tests of `tests/test_combine.py` in fitscube.
+//! Input checks, blank channels, beams and CLI behaviour. Many cases come from
+//! fitscube's test_combine_guards.py, test_zero_beams.py and test_combine.py.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 

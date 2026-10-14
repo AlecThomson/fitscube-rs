@@ -29,10 +29,8 @@ def _write_image(
     reffreq: float | None = None,
     date_obs: str | None = None,
     beam: float | None = None,
-    # 30x30 planes keep the cube well above fitscube's 1801-element small-cube
-    # threshold. (Older fitscube builds corrupted data on the in-memory
-    # small-cube path; v2.3.0 fixed it, but staying large keeps the tests robust
-    # across reference versions.)
+    # Above fitscube's 1801-element small-cube path, which corrupted data
+    # before v2.3.0
     ny: int = 30,
     nx: int = 30,
 ) -> None:
