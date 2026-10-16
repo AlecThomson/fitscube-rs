@@ -35,13 +35,11 @@ pub fn read_spec_from_header(path: &Path, time_domain_mode: bool) -> Result<f64>
     InputHeader::read(path)?.spec(path, time_domain_mode)
 }
 
-/// For each element, whether it is close to any of `test`.
-///
-/// fitscube passes `atol` and `rtol` to `np.isclose` in swapped positions; these
-/// are the tolerances it ends up using.
+/// For each element, whether it is close to any of `test`: about 0.5 s for MJD
+/// seconds and 1 Hz at 1 GHz.
 pub fn isin_close(elements: &[f64], test: &[f64], time_domain_mode: bool) -> Vec<bool> {
     let (atol, rtol) = if time_domain_mode {
-        (1e-10, 1e-9)
+        (1e-9, 1e-10)
     } else {
         (1e-5, 1e-9)
     };
@@ -68,12 +66,6 @@ fn np_arange_fix(start: f64, stop: f64, step: f64) -> Vec<f64> {
     }
     out
 }
-
-/// Smallest step `grid_step` accepts, as a fraction of the smallest diff.
-const MAX_BLANKS_PER_GAP: f64 = 16.0;
-
-/// Most grid points `even_spacing` builds per input value.
-const MAX_GRID_PER_INPUT: f64 = 1000.0;
 
 /// Channel width of a regular grid with missing channels: the gcd of the
 /// diffs, so channels 0, 3, 5 give 1 rather than `min(diffs) = 2`. Falls back
@@ -104,8 +96,8 @@ fn grid_step(diffs: &[f64]) -> f64 {
         let q = d.abs() / g;
         (q - q.round()).abs() <= 1e-3
     });
-    // Diffs of 1e6 and 1e6 + 2 have a gcd of 2
-    if g <= tol || !divides_all || g < min_diff / MAX_BLANKS_PER_GAP {
+    // A gcd far below every diff is float noise: diffs of 1e6 and 1e6 + 2 give 2.
+    if g <= tol || !divides_all || g * 16.0 < min_diff {
         min_diff
     } else {
         g
@@ -128,7 +120,8 @@ pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, 
     let diffs: Vec<f64> = sorted.windows(2).map(|w| w[1] - w[0]).collect();
     let step = grid_step(&diffs);
     let span = sorted[sorted.len() - 1] - sorted[0];
-    if span / step > MAX_GRID_PER_INPUT * sorted.len() as f64 {
+    let max_channels = 1000.0 * sorted.len() as f64;
+    if span / step > max_channels {
         return Err(FitsCubeError::IrregularSpacing(format!(
             "A regular grid of step {step} over {} values spanning {span} would need \
              {:.0} channels. Combine without blank channels.",
@@ -252,6 +245,14 @@ pub fn parse_specs(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn one_second_time_steps() {
+        let times: Vec<f64> = [0.0, 1.0, 3.0, 4.0].iter().map(|t| 5.18e9 + t).collect();
+        let (new, missing) = even_spacing(&times, true).unwrap();
+        assert_eq!(new.len(), 5);
+        assert_eq!(missing, vec![false, false, true, false, false]);
+    }
 
     #[test]
     fn even_axis_has_no_missing() {

@@ -7,7 +7,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::error::Result;
-use crate::partial::PartialFile;
+use crate::partial::partial_file;
 
 /// Gzip `path` to `path.gz` and delete `path`. Returns the new path.
 pub fn compress_cube(path: &Path) -> Result<PathBuf> {
@@ -16,19 +16,16 @@ pub fn compress_cube(path: &Path) -> Result<PathBuf> {
     let gz_path = PathBuf::from(gz_name);
     tracing::info!("Compressing {} to {}", path.display(), gz_path.display());
 
-    let partial = PartialFile::create(&gz_path)?;
+    let partial = partial_file(&gz_path)?;
     let mut src = BufReader::new(File::open(path)?);
     // Python's gzip.open defaults to level 9
-    let mut gz = GzEncoder::new(
-        BufWriter::new(File::create(&partial.path)?),
-        Compression::best(),
-    );
+    let mut gz = GzEncoder::new(BufWriter::new(File::create(&partial)?), Compression::best());
     std::io::copy(&mut src, &mut gz)?;
     gz.finish()?
         .into_inner()
         .map_err(|e| e.into_error())?
         .sync_all()?;
-    partial.persist(&gz_path)?;
+    partial.persist(&gz_path).map_err(|e| e.error)?;
     std::fs::remove_file(path)?;
     Ok(gz_path)
 }

@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use crate::beams::{Beam, read_beam_table};
 use crate::combine::{check_exists, in_pool};
 use crate::error::{FitsCubeError, Result};
-use crate::partial::PartialFile;
+use crate::partial::partial_file;
 use crate::pixels::with_pixel_type;
 use crate::wcs::{find_axis, world};
 
@@ -226,12 +226,13 @@ impl Cube {
                 return Err(FitsCubeError::OutputExists(out.to_path_buf()));
             }
         }
-        let partial = PartialFile::create(out)?;
+        let partial = partial_file(out)?;
         with_pixel_type!(
             self.geom.bitpix,
-            copy_plane(self, fptr, index, beam, &partial.path)
+            copy_plane(self, fptr, index, beam, &partial)
         )?;
-        partial.persist(out)
+        partial.persist(out).map_err(|e| e.error)?;
+        Ok(())
     }
 }
 
