@@ -25,7 +25,7 @@ use crate::checks::{
     read_input_headers,
 };
 use crate::error::{FitsCubeError, Result};
-use crate::partial::PartialFile;
+use crate::partial::partial_file;
 use crate::pixels::bbox_ranges;
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
@@ -147,8 +147,8 @@ pub fn combine_fits(
     };
     let (layout, plane_len) = header.build()?;
 
-    let partial = PartialFile::create(out_cube)?;
-    let file = File::options().read(true).write(true).open(&partial.path)?;
+    let partial = partial_file(out_cube)?;
+    let file = File::options().read(true).write(true).open(&partial)?;
     let source = PlaneSource {
         files: file_list,
         headers: &headers,
@@ -177,10 +177,10 @@ pub fn combine_fits(
     drop(file);
 
     if varying_beams && let Some(beams) = &channels.beams {
-        let mut fptr = FitsFile::edit(&partial.path)?;
+        let mut fptr = FitsFile::edit(&partial)?;
         beams::write_beam_table(&mut fptr, beams, &stokes_idx)?;
     }
-    partial.persist(out_cube)?;
+    partial.persist(out_cube).map_err(|e| e.error)?;
     Ok(channels.specs)
 }
 
