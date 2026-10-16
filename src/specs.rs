@@ -35,13 +35,11 @@ pub fn read_spec_from_header(path: &Path, time_domain_mode: bool) -> Result<f64>
     InputHeader::read(path)?.spec(path, time_domain_mode)
 }
 
-/// For each element, whether it is close to any of `test`.
-///
-/// fitscube passes `atol` and `rtol` to `np.isclose` in swapped positions; these
-/// are the tolerances it ends up using.
+/// For each element, whether it is close to any of `test`: about 0.5 s for MJD
+/// seconds and 1 Hz at 1 GHz.
 pub fn isin_close(elements: &[f64], test: &[f64], time_domain_mode: bool) -> Vec<bool> {
     let (atol, rtol) = if time_domain_mode {
-        (1e-10, 1e-9)
+        (1e-9, 1e-10)
     } else {
         (1e-5, 1e-9)
     };
@@ -252,6 +250,14 @@ pub fn parse_specs(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    #[test]
+    fn one_second_time_steps() {
+        let times: Vec<f64> = [0.0, 1.0, 3.0, 4.0].iter().map(|t| 5.18e9 + t).collect();
+        let (new, missing) = even_spacing(&times, true).unwrap();
+        assert_eq!(new.len(), 5);
+        assert_eq!(missing, vec![false, false, true, false, false]);
+    }
 
     #[test]
     fn even_axis_has_no_missing() {
