@@ -6,9 +6,6 @@ use fitsio::tables::{ColumnDataType, ColumnDescription};
 use crate::checks::InputHeader;
 use crate::error::{FitsCubeError, Result};
 
-/// cfitsio `BAD_HDU_NUM`, returned when no HDU has the requested name.
-const BAD_HDU_NUM: i32 = 301;
-
 /// A restoring beam in degrees.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Beam {
@@ -170,7 +167,9 @@ pub fn write_beam_table(fptr: &mut FitsFile, beams: &[Beam], stokes_idx: &[i32])
 pub fn read_beam_table(fptr: &mut FitsFile) -> Result<Option<Vec<Beam>>> {
     let hdu = match fptr.hdu("BEAMS") {
         Ok(hdu) => hdu,
-        Err(fitsio::errors::Error::Fits(e)) if e.status == BAD_HDU_NUM => return Ok(None),
+        Err(fitsio::errors::Error::Fits(e)) if e.status == fitsio::sys::BAD_HDU_NUM as i32 => {
+            return Ok(None);
+        }
         Err(e) => return Err(e.into()),
     };
     let bmaj: Vec<f32> = hdu.read_col(fptr, "BMAJ")?;
