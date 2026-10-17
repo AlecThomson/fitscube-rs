@@ -13,7 +13,8 @@ use atfits_rs::{
     CubeLayout, create_mem_cube, delete_key, extract_header_layout, key_f64, update_key_f64,
     update_key_i64, update_key_logical, update_key_str, write_comment,
 };
-use fitsio::FitsFile;
+use fitsio::errors::check_status;
+use fitsio::{FitsFile, sys};
 use num_traits::Float;
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -139,6 +140,7 @@ pub fn combine_fits(
         template: &file_list[0],
         first,
         specs: &channels.specs,
+        spec_error: channels.spec_error,
         ignore_spec: options.ignore_spec,
         varying_beams,
         time_domain_mode: options.time_domain_mode,
@@ -217,6 +219,8 @@ pub(crate) fn in_pool<R: Send>(pool: Option<&ThreadPool>, f: impl FnOnce() -> R 
 /// The channels of the cube in axis order.
 struct Channels {
     specs: Vec<f64>,
+    /// Largest distance of an input from its channel, when blanks were made.
+    spec_error: Option<f64>,
     /// Index of each channel's input, `None` for a NaN plane.
     inputs: Vec<Option<usize>>,
     /// Beam of each channel, if any input has one.
@@ -269,6 +273,7 @@ fn plan_channels(
     };
     Ok(Channels {
         specs,
+        spec_error: spec_info.spec_error,
         inputs,
         beams,
     })
@@ -387,11 +392,21 @@ fn is_evenly_spaced(specs: &[f64], time_domain_mode: bool) -> bool {
     diff.len() < 2 || max_dev < mean_diff * 0.02
 }
 
+fn write_history(fptr: &mut FitsFile, text: &str) -> Result<()> {
+    let text = std::ffi::CString::new(text).expect("history has no NUL bytes");
+    let mut status = 0;
+    // SAFETY: `fptr` is open and `text` outlives the call.
+    unsafe { sys::ffphis(fptr.as_raw(), text.as_ptr(), &mut status) };
+    check_status(status)?;
+    Ok(())
+}
+
 /// What the cube header is built from.
 struct CubeHeader<'a> {
     template: &'a Path,
     first: &'a InputHeader,
     specs: &'a [f64],
+    spec_error: Option<f64>,
     ignore_spec: bool,
     varying_beams: bool,
     time_domain_mode: bool,
@@ -472,6 +487,16 @@ impl CubeHeader<'_> {
         } else {
             update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
             update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
+            if let Some(error) = self.spec_error {
+                update_key_f64(&mut fptr, &format!("CSYER{fi}"), error)?;
+                write_history(
+                    &mut fptr,
+                    &format!(
+                        "fitscube placed the inputs on a regular {ctype} grid. Each is \
+                         within CSYER{fi} of its plane."
+                    ),
+                )?;
+            }
         }
         if (first.has_cd || first.has_pc) && fi != 1 {
             let kind = if first.has_cd { "CD" } else { "PC" };
