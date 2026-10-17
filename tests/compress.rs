@@ -440,3 +440,41 @@ fn compress_and_decompress_cli() {
     assert!(!compressed.exists());
     assert!(same(&read_image(&path, 0), &data));
 }
+
+#[test]
+fn table_header_never_grows_past_its_placeholder() {
+    // Blanks only in the last plane, and every header length up to a whole
+    // block, so one case would cross a block if late blanks added a card
+    for method in [CompressMethod::TileRice, CompressMethod::TileGzip] {
+        for extra_cards in 0..36 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cube.fits");
+            let plane = 40 * 48;
+            let mut data = noise(3 * plane);
+            data[3 * plane - 8 * 48..].fill(f32::NAN);
+            let desc = ImageDescription {
+                data_type: ImageType::Float,
+                dimensions: &[3, 40, 48],
+            };
+            let mut f = FitsFile::create(&path)
+                .with_custom_primary(&desc)
+                .open()
+                .unwrap();
+            let hdu = f.primary_hdu().unwrap();
+            hdu.write_image(&mut f, &data).unwrap();
+            for i in 0..extra_cards {
+                atfits_rs::write_comment(&mut f, &format!("padding {i}")).unwrap();
+            }
+            drop(f);
+
+            let compressed = compress_cube(&path, &options(method)).unwrap();
+            let got = read_image(&compressed, 1);
+            for (a, b) in data.iter().zip(&got) {
+                assert_eq!(a.is_nan(), b.is_nan(), "{method:?}, {extra_cards} cards");
+            }
+            if method == CompressMethod::TileGzip {
+                assert!(same(&got, &data), "{extra_cards} cards");
+            }
+        }
+    }
+}

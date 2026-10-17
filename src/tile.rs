@@ -329,6 +329,7 @@ pub(crate) fn tile_compress(
     let table_start = out.stream_position()?;
     let mut descriptors = vec![0u8; n_rows * table.row_width()];
     let mut max_lengths = [0usize; 2];
+    let placeholder_len = table.header(0, max_lengths).len();
     out.write_all(&table.header(0, max_lengths))?;
     out.write_all(&descriptors)?;
 
@@ -395,9 +396,15 @@ pub(crate) fn tile_compress(
 
     let end = out.stream_position()?;
     out.write_all(&vec![0u8; (2880 - end as usize % 2880) % 2880])?;
+    // Only fixed-width values change, but a header that grew would overwrite the table
+    let header = table.header(heap_size, max_lengths);
+    if header.len() != placeholder_len {
+        return Err(FitsCubeError::Atfits(
+            "the table header grew past its placeholder".into(),
+        ));
+    }
     out.seek(SeekFrom::Start(table_start))?;
-    // Same size as the placeholder: only fixed-width values change
-    out.write_all(&table.header(heap_size, max_lengths))?;
+    out.write_all(&header)?;
     out.write_all(&descriptors)?;
     out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
 
