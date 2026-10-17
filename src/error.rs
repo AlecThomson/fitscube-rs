@@ -92,6 +92,27 @@ pub enum FitsCubeError {
     #[error("could not parse DATE-OBS {value:?}: {msg}")]
     TimeParse { value: String, msg: String },
 
+    #[error("RICE_1 cannot store floats losslessly; use GZIP_2, or a quantize_level above 0")]
+    RiceNeedsQuantize,
+
+    #[error("{0} is already compressed")]
+    AlreadyCompressed(PathBuf),
+
+    #[error("{path} holds integers (BITPIX={bitpix}); only float cubes are supported")]
+    IntegerTiles { path: PathBuf, bitpix: i64 },
+
+    #[error(
+        "{0} was already quantized once (FCLOSSY=T), and quantizing again adds a new error \
+         each time. Use lossless 'tile-gzip', or set allow_requantize to accept the extra error."
+    )]
+    AlreadyQuantized(PathBuf),
+
+    #[error("{0} holds no tile-compressed image")]
+    NotTileCompressed(PathBuf),
+
+    #[error("Cannot derive an output name for {0}; pass output")]
+    NoOutputName(PathBuf),
+
     #[error("a worker thread panicked")]
     WorkerPanic,
 

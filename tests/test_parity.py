@@ -20,6 +20,7 @@ import fitscube_rs
 # The reference implementation. Skip the whole module if it is not installed.
 fitscube = pytest.importorskip("fitscube")
 fitscube_extract = pytest.importorskip("fitscube.extract")
+fitscube_compress = pytest.importorskip("fitscube.compress")
 
 
 def _write_image(
@@ -569,3 +570,142 @@ def test_extract_planes_from_cube(tmp_path):
             for key in ("NAXIS3", "CRPIX3", "CRVAL3", "CDELT3", "BMAJ", "BMIN", "BPA"):
                 assert rs_h[key] == pytest.approx(ref_h[key], rel=1e-6), key
             assert "CASAMBM" not in rs_h
+
+
+def _write_noise_cube(path: Path, shape=(2, 5, 40, 48)) -> np.ndarray:
+    """Float noise with a blanked strip, an all-blank plane, a constant plane and beams."""
+    rng = np.random.default_rng(42)
+    data = rng.normal(0, 1e-3, shape).astype(np.float32)
+    data[..., :8, :] = np.nan
+    data[0, 1] = np.nan
+    data[1, 2] = 0.5
+    header = fits.Header()
+    header["BUNIT"] = "Jy/beam"
+    header["CTYPE3"] = "FREQ"
+    beams = fits.BinTableHDU.from_columns(
+        [fits.Column(name="BMAJ", format="E", array=np.arange(shape[-3], dtype=float))],
+        name="BEAMS",
+    )
+    fits.HDUList([fits.PrimaryHDU(data, header), beams]).writeto(path)
+    return data
+
+
+def _compress_both(tmp_path: Path, method: str) -> tuple[Path, Path, np.ndarray]:
+    """The same cube compressed by fitscube and fitscube_rs."""
+    outputs = []
+    for name, compress in (
+        ("ref", fitscube_compress.compress_cube),
+        ("rs", fitscube_rs.compress_cube),
+    ):
+        cube = tmp_path / name / "cube.fits"
+        cube.parent.mkdir()
+        data = _write_noise_cube(cube)
+        outputs.append(compress(cube, method=method))
+    return outputs[0], outputs[1], data
+
+
+def test_tile_gzip_decodes_exactly(tmp_path):
+    """astropy reads the Rust GZIP_2 cube back exactly, beams included."""
+    ref, rs, data = _compress_both(tmp_path, "tile-gzip")
+    with fits.open(rs) as rs_hdul, fits.open(ref) as ref_hdul:
+        np.testing.assert_array_equal(rs_hdul[1].data, data)
+        assert rs_hdul[1].header["BUNIT"] == ref_hdul[1].header["BUNIT"]
+        np.testing.assert_array_equal(
+            rs_hdul["BEAMS"].data["BMAJ"], ref_hdul["BEAMS"].data["BMAJ"]
+        )
+
+
+def test_tile_rice_matches_fitscube(tmp_path):
+    """Same blanks, same dither seed and an error as small as fitscube's.
+
+    Values differ slightly: astropy fills blanks before estimating the noise,
+    while CFITSIO skips them.
+    """
+    ref, rs, data = _compress_both(tmp_path, "tile-rice")
+    ref_data, rs_data = fits.getdata(ref, 1), fits.getdata(rs, 1)
+    np.testing.assert_array_equal(np.isnan(rs_data), np.isnan(ref_data))
+    np.testing.assert_array_equal(rs_data[1, 2], data[1, 2])
+    finite = np.isfinite(data)
+    bound = 1e-3 / 4 / np.sqrt(12) * 1.2
+    assert np.std(rs_data[finite] - data[finite]) < bound
+    assert np.std(ref_data[finite] - data[finite]) < bound
+    raw = {"disable_image_compression": True}
+    assert (
+        fits.getheader(rs, 1, **raw)["ZDITHER0"]
+        == fits.getheader(ref, 1, **raw)["ZDITHER0"]
+    )
+
+
+@pytest.mark.parametrize("method", ["gzip", "tile-gzip", "tile-rice"])
+def test_decompress_matches_fitscube(tmp_path, method):
+    """Each decompresses the other's cubes to the same data and marks."""
+    ref, rs, _ = _compress_both(tmp_path, method)
+    out = {}
+    for name, compressed in (("ref", ref), ("rs", rs)):
+        out[name] = (
+            fitscube_compress.decompress_cube(
+                compressed, output=tmp_path / f"{name}_by_ref.fits"
+            ),
+            fitscube_rs.decompress_cube(
+                compressed, output=tmp_path / f"{name}_by_rs.fits"
+            ),
+        )
+    for by_ref, by_rs in out.values():
+        np.testing.assert_array_equal(fits.getdata(by_rs), fits.getdata(by_ref))
+        ref_h, rs_h = fits.getheader(by_ref), fits.getheader(by_rs)
+        for key in ("BUNIT", "CTYPE3", "NAXIS4", "FCLOSSY", "FCQLEVEL"):
+            assert rs_h.get(key) == ref_h.get(key), key
+        np.testing.assert_array_equal(
+            fits.getdata(by_rs, "BEAMS")["BMAJ"], fits.getdata(by_ref, "BEAMS")["BMAJ"]
+        )
+
+
+def test_pgzip_reads_as_gzip(tmp_path):
+    """Rust pgzip writes gzip members that fitscube's plain gzip reader joins."""
+    cube = tmp_path / "cube.fits"
+    data = _write_noise_cube(cube)
+    original = cube.read_bytes()
+    compressed = fitscube_rs.compress_cube(cube, method="pgzip", max_workers=4)
+    restored = fitscube_compress.decompress_cube(compressed)
+    assert restored.read_bytes() == original
+    np.testing.assert_array_equal(fits.getdata(restored), data)
+
+
+def test_cd_matrix_carries_the_step(tmp_path):
+    """A CD matrix input keeps the spectral step in CD3_3, as fitscube does."""
+
+    def make(d: Path) -> list[Path]:
+        files = _make_freq_images(d, [1.0e9, 1.1e9, 1.2e9])
+        for f in files:
+            with fits.open(f, mode="update") as hdul:
+                h = hdul[0].header
+                h["CD1_1"], h["CD2_2"] = h.pop("CDELT1"), h.pop("CDELT2")
+        return files
+
+    ref, rs = _combine_both(tmp_path, make)
+    ref_h, rs_h = fits.getheader(ref), fits.getheader(rs)
+    assert rs_h["CD3_3"] == pytest.approx(ref_h["CD3_3"])
+    assert rs_h["CD3_3"] == pytest.approx(1e8)
+
+
+def test_time_axis_reference_is_set(tmp_path):
+    """Time cubes are in UTC MJD seconds from MJD 0, whatever the inputs said."""
+
+    def make(d: Path) -> list[Path]:
+        d.mkdir(parents=True, exist_ok=True)
+        files = []
+        for i in range(3):
+            p = d / f"img_{i}.fits"
+            _write_image(p, fill=float(i), date_obs=f"2024-01-01T00:0{i}:00")
+            with fits.open(p, mode="update") as hdul:
+                hdul[0].header["MJDREFI"] = 50000
+                hdul[0].header["TIMESYS"] = "TAI"
+            files.append(p)
+        return files
+
+    ref, rs = _combine_both(tmp_path, make, time_domain_mode=True)
+    ref_h, rs_h = fits.getheader(ref), fits.getheader(rs)
+    for key in ("MJDREF", "TIMESYS"):
+        assert rs_h[key] == ref_h[key], key
+    assert "MJDREFI" not in rs_h
+    assert "MJDREFI" not in ref_h

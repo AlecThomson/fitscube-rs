@@ -8,6 +8,8 @@ import typing
 __all__ = [
     "BoundingBox",
     "combine_fits",
+    "compress_cube",
+    "decompress_cube",
     "extract_plane_from_cube",
     "extract_planes_from_cube",
     "get_common_bounding_box",
@@ -107,6 +109,58 @@ def combine_fits(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib
         NotImplementedError: For per-channel beams on a multi-Stokes cube.
         OSError: On a FITS read or write error.
         ValueError: On other invalid input.
+    """
+
+def compress_cube(cube: builtins.str | os.PathLike | pathlib.Path, method: builtins.str = 'gzip', max_workers: typing.Optional[builtins.int] = None, quantize_level: builtins.float = 4.0, tile_shape: typing.Optional[tuple[builtins.int, builtins.int]] = None, allow_requantize: builtins.bool = False, remove: builtins.bool = True) -> pathlib.Path:
+    r"""
+    Compress a finished cube.
+    
+    Args:
+        cube (str): Path of the uncompressed cube.
+        method (str): 'gzip' and 'pgzip' gzip the whole file to ``.fits.gz``,
+            'pgzip' across threads. 'tile-gzip' (lossless) and 'tile-rice'
+            (lossy) tile-compress to ``.fits.fz``, as fpack does.
+        max_workers (int, optional): Threads for 'pgzip' and the tile methods.
+            Defaults to one per core.
+        quantize_level (float): Quantization steps per noise sigma for 'tile-rice'.
+        tile_shape (tuple[int, int], optional): (y, x) tile size for the tile
+            methods. Defaults to bands of 64 full-width rows.
+        allow_requantize (bool): Let 'tile-rice' quantize a cube that was
+            already quantized once.
+        remove (bool): Delete ``cube`` once the compressed cube is written.
+    
+    Returns:
+        Path: The compressed cube.
+    
+    Raises:
+        ValueError: For a compressed, integer or already quantized input, or
+            an unknown method.
+        OSError: On a read or write error.
+    """
+
+def decompress_cube(cube: builtins.str | os.PathLike | pathlib.Path, output: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None, overwrite: builtins.bool = False, remove: builtins.bool = False) -> pathlib.Path:
+    r"""
+    Write a gzipped or tile-compressed cube back out as plain FITS.
+    
+    A cube that was quantized (lossy) is marked ``FCLOSSY = T``, with
+    ``FCQLEVEL`` and a HISTORY card, so that later compression knows not to
+    quantize it again.
+    
+    Args:
+        cube (str): A ``.fits.gz`` or tile-compressed (``.fits.fz``) cube.
+        output (str, optional): Where to write. Defaults to ``cube`` without
+            its ``.gz``/``.fz`` suffix.
+        overwrite (bool): Replace ``output`` if it exists.
+        remove (bool): Delete ``cube`` once the output is written.
+    
+    Returns:
+        Path: The uncompressed cube.
+    
+    Raises:
+        FileExistsError: If ``output`` exists and ``overwrite`` is not set.
+        ValueError: If no output name can be derived, or a ``.fz`` file has no
+            tile-compressed image.
+        OSError: On a read or write error.
     """
 
 def extract_plane_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Path, channel_index: typing.Optional[builtins.int] = None, time_index: typing.Optional[builtins.int] = None, hdu_index: builtins.int = 0, overwrite: builtins.bool = False, output_path: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None) -> builtins.str:
