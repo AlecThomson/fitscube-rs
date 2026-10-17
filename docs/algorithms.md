@@ -1,7 +1,7 @@
 # Algorithm background
 
 What fitscube-rs does when it combines single-plane FITS images into a cube,
-and when it extracts planes back out. It follows the conventions of
+extracts planes back out, and compresses a cube. It follows the conventions of
 [`fitscube`](https://github.com/AlecThomson/fitscube), so cubes from either
 tool are interchangeable.
 
@@ -32,7 +32,8 @@ place at the end, so a failed combine leaves no partial cube.
   with the FITS defaults for missing cards. `CUNIT` may be Hz, kHz, MHz or GHz;
   other units are an error. The cube gets a `FREQ` axis in Hz.
 - **Time** (`--time-domain`): each image's `DATE-OBS`, as MJD seconds. The cube
-  gets a `TIME` axis in seconds.
+  gets a `TIME` axis in seconds, with `MJDREF = 0` and `TIMESYS = 'UTC'`
+  whatever time reference the inputs used.
 
 `--spec-file` (one value per line) or `--specs` supply the values instead of
 the headers. NaN or infinite values are an error.
@@ -110,9 +111,39 @@ copied as they are, so integer cubes extract exactly. If the cube has a
 `BEAMS` table, the plane's beam goes into `BMAJ`/`BMIN`/`BPA` and `CASAMBM` is
 removed. `--hdu-index` picks the HDU, which may be an image extension.
 
-`extract_planes_from_cube` (Python and Rust) writes every channel to its own
-file, reading the beam table once.
+`extract_planes_from_cube` (Python and Rust) writes every plane to its own
+file, reading the beam table once. It splits along FREQ or TIME, whichever has
+more than one plane.
 
-fitscube computes the extracted `CRVAL` as `CRVAL + index * CDELT`, ignoring
-`CRPIX`; fitscube-rs uses `CRPIX`, so the two differ for cubes whose `CRPIX`
-on that axis is not 1.
+## Compression
+
+`compress` writes the cube one of four ways, the same as fitscube 2.10:
+
+- `gzip` and `pgzip` gzip the whole file to `.fits.gz`. `pgzip` gzips 8 MB
+  chunks across threads, as separate gzip members that any gzip reader joins.
+- `tile-gzip` and `tile-rice` write `.fits.fz`, the tile-compressed format
+  `fpack` writes, with the image in HDU 1 and the other HDUs (the beam table)
+  after it. Tiles are bands of 64 full-width rows.
+  - `tile-gzip` (GZIP_2) is lossless.
+  - `tile-rice` (RICE_1) first quantises each tile to `--quantize-level` steps
+    per noise sigma, with CFITSIO's own quantiser and subtractive dithering.
+    Blank pixels stay blank. A tile with no noise, such as a constant one, is
+    stored exactly instead.
+
+The tiles are compressed across threads but written in order, so the output
+does not depend on the thread count. The dither seed (`ZDITHER0`) comes from
+the middle plane, as in fitscube, so the same cube gives the same file, and a
+cube that changed (for instance by being quantised once already) is dithered
+afresh.
+
+`tile-rice` values differ slightly from fitscube's. astropy fills blank pixels
+before it estimates the noise of a tile, while CFITSIO skips them, so the two
+pick slightly different quantisation steps. The error is the same size, about
+`sigma / quantize_level / sqrt(12)`.
+
+`decompress` writes plain FITS back, decompressing planes across threads. A
+cube that was quantised is marked `FCLOSSY = T`, with `FCQLEVEL` and a
+`HISTORY` card, and `tile-rice` refuses such a cube unless given
+`--allow-requantize`, since every round of quantising adds a new error. How to
+read compressed cubes without decompressing them, and their pitfalls, is in
+[fitscube's README](https://github.com/AlecThomson/fitscube#compressed-cubes).

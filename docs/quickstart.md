@@ -108,4 +108,5 @@ The same from the shell, with the [`fitscubers` CLI](cli.md):
 ```sh
 fitscubers combine chan_*.fits cube.fits --overwrite
 fitscubers extract cube.fits --channel-index 2 --output-path chan2.fits
+fitscubers compress cube.fits --method tile-rice
 ```
