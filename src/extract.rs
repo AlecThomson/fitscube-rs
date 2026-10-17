@@ -82,9 +82,14 @@ fn create_target_index(opts: &ExtractOptions) -> Result<TargetIndex> {
     }
 }
 
-/// `cube.fits` to `cube.channel-5.fits`.
+/// `cube.fits` (or `cube.fits.gz`, `cube.fits.fz`) to `cube.channel-5.fits`.
 fn default_output_path(input: &Path, output_name: &str, index: usize) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    // Planes are written uncompressed, so name them as plain FITS
+    let input = match input.extension().and_then(|e| e.to_str()) {
+        Some("gz" | "fz") => Path::new(input.file_stem().unwrap_or_default()),
+        _ => input,
+    };
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     let ext = input.extension().unwrap_or_default().to_string_lossy();
     parent.join(format!("{stem}.{output_name}-{index}.{ext}"))
@@ -102,15 +107,17 @@ pub fn extract_plane_from_cube(cube: &Path, opts: &ExtractOptions) -> Result<Pat
     Ok(out_path)
 }
 
-/// Extract every channel of `cube` into its own image and return their paths.
+/// Extract every plane of `cube` into its own image and return their paths.
 ///
-/// The cube and its beam table are read once, rather than once per plane.
+/// Planes are taken along the FREQ or TIME axis, whichever has more than one
+/// plane. The cube and its beam table are read once, rather than once per plane.
 pub fn extract_planes_from_cube(cube: &Path, opts: &ExtractPlanesOptions) -> Result<Vec<PathBuf>> {
-    let (_, source) = Cube::open(cube, opts.hdu_index, "FREQ")?;
+    let (axis_name, output_name) = find_plane_axis(cube, opts.hdu_index)?;
+    let (_, source) = Cube::open(cube, opts.hdu_index, axis_name)?;
     let n = source.n_planes();
     let out_paths = match &opts.output_paths {
         None => (0..n)
-            .map(|i| default_output_path(cube, "channel", i))
+            .map(|i| default_output_path(cube, output_name, i))
             .collect(),
         Some(paths) if paths.len() == n => paths.clone(),
         Some(paths) => {
@@ -141,6 +148,32 @@ pub fn extract_planes_from_cube(cube: &Path, opts: &ExtractPlanesOptions) -> Res
         )
     })?;
     Ok(out_paths)
+}
+
+/// The axis to split a cube along: FREQ or TIME, whichever has more than one
+/// plane (a time cube made from images keeps their one-plane FREQ axis).
+fn find_plane_axis(cube: &Path, hdu_index: usize) -> Result<(&'static str, &'static str)> {
+    check_exists(cube)?;
+    let mut fptr = FitsFile::open(cube)?;
+    fptr.hdu(hdu_index)?;
+    let dims = HeaderGeom::from_file(&mut fptr)?.dims;
+    let mut found = Vec::new();
+    for (axis_name, output_name) in [("FREQ", "channel"), ("TIME", "timestep")] {
+        if let Some(axis) = find_axis(&mut fptr, axis_name)? {
+            found.push((axis_name, output_name, dims[axis.fits_idx - 1]));
+        }
+    }
+    let long: Vec<_> = found.iter().filter(|(_, _, n)| *n > 1).collect();
+    match (long.as_slice(), found.first()) {
+        ([(axis_name, output_name, _)], _) => Ok((axis_name, output_name)),
+        ([], Some((axis_name, output_name, _))) => Ok((axis_name, output_name)),
+        ([], None) => Err(FitsCubeError::TargetAxisMissing(
+            "Did not find a FREQ or TIME axis".to_string(),
+        )),
+        _ => Err(FitsCubeError::InvalidSpec(
+            "Both the FREQ and TIME axes have more than one plane, so cannot pick one".to_string(),
+        )),
+    }
 }
 
 /// The parts of a cube that every extracted plane needs.
@@ -288,6 +321,10 @@ mod tests {
     fn output_path_default() {
         let p = default_output_path(Path::new("/data/cube.fits"), "channel", 5);
         assert_eq!(p, PathBuf::from("/data/cube.channel-5.fits"));
+        for compressed in ["/data/cube.fits.gz", "/data/cube.fits.fz"] {
+            let p = default_output_path(Path::new(compressed), "channel", 5);
+            assert_eq!(p, PathBuf::from("/data/cube.channel-5.fits"));
+        }
     }
 
     #[test]
