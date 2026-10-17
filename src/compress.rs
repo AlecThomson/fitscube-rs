@@ -7,24 +7,23 @@ use std::path::{Path, PathBuf};
 
 use atfits_rs::{
     Pixel, as_bytes, disable_scaling, extract_header_layout, image_shape, key_f64, key_i64,
-    key_string, read_pixels, swap_to_be, update_key_f64, update_key_i64, update_key_logical,
+    key_string, read_pixels, swap_to_be, update_key_f64, update_key_logical,
 };
 use fitsio::FitsFile;
 use fitsio::errors::check_status;
-use fitsio::sys::{self, LONGLONG};
+use fitsio::sys;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use num_traits::Float;
 use rayon::prelude::*;
 
-use crate::combine::in_pool;
+use crate::combine::{in_pool, write_at};
 use crate::error::{FitsCubeError, Result};
+use crate::header::plain_header;
 use crate::partial::partial_file;
-use crate::pixels::with_pixel_type;
+use crate::pixels::{NullValue, with_pixel_type};
 use crate::tile::{
     TileCodec, TileSettings, copy_other_hdus, has_compressed_hdu, image_kind, tile_compress,
-    user_cards,
 };
 
 /// How to compress a cube.
@@ -273,7 +272,7 @@ fn untile_cube(cube: &Path, output: &Path) -> Result<()> {
     let bitpix = i64::from(bitpix);
     let dims = image_shape(&mut fptr)?;
 
-    let mut header = image_header(&mut fptr, bitpix, &dims)?;
+    let mut header = plain_header(&mut fptr, bitpix, &dims)?;
     // Quantised tiles always carry a scale, whatever the dithering
     let n_fields = key_i64(&mut fptr, "TFIELDS")?.unwrap_or(0);
     let mut quantised = false;
@@ -302,99 +301,58 @@ fn untile_cube(cube: &Path, output: &Path) -> Result<()> {
     }
     let layout = extract_header_layout(&mut header, &dims)?;
 
-    let mut out = BufWriter::with_capacity(8 << 20, File::create(output)?);
-    out.write_all(&layout.header)?;
-    let written = with_pixel_type!(bitpix, write_planes(&mut fptr, &dims, &mut out))?;
-    out.write_all(&vec![0u8; (2880 - (written % 2880) as usize) % 2880])?;
-    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
     drop(fptr);
+
+    let out = File::create(output)?;
+    write_at(&out, &layout.header, 0)?;
+    let data_len = dims.iter().product::<usize>() as u64 * bitpix.unsigned_abs() / 8;
+    // Sized up front, so the planes can land in any order and the padding is zeros
+    out.set_len(layout.datastart + data_len.div_ceil(2880) * 2880)?;
+    with_pixel_type!(
+        bitpix,
+        write_planes(cube, index, &dims, &out, layout.datastart)
+    )?;
+    out.sync_all()?;
 
     copy_other_hdus(cube, output, &[0, index])
 }
 
-/// A new in-memory primary image with the uncompressed header of the current
-/// (compressed) HDU of `fptr`.
-fn image_header(fptr: &mut FitsFile, bitpix: i64, dims: &[usize]) -> Result<FitsFile> {
-    // Not CFITSIO's ffcnvthdr2str, which writes the whole image into memory
-    let cards = user_cards(fptr, bitpix > 0)?;
-    let mut status = 0;
-    let mut raw: *mut sys::fitsfile = std::ptr::null_mut();
-    unsafe { sys::ffinit(&mut raw, c"mem://".as_ptr(), &mut status) };
-    check_status(status)?;
-    let mut header = unsafe { FitsFile::from_raw(raw, fitsio::FileOpenMode::READWRITE)? };
-    let mut naxes: Vec<LONGLONG> = vec![1; dims.len()];
-    unsafe {
-        sys::ffcrimll(
-            header.as_raw(),
-            bitpix as c_int,
-            naxes.len() as c_int,
-            naxes.as_mut_ptr(),
-            &mut status,
-        )
-    };
-    check_status(status)?;
-    for card in cards.chunks(80) {
-        let card =
-            std::ffi::CString::new(card).map_err(|e| FitsCubeError::Atfits(e.to_string()))?;
-        unsafe { sys::ffprec(header.as_raw(), card.as_ptr(), &mut status) };
-        check_status(status)?;
-    }
-    if bitpix > 0
-        && let Some(blank) = key_i64(fptr, "ZBLANK")?
-    {
-        update_key_i64(&mut header, "BLANK", blank)?;
-    }
-    // Re-read the header so CFITSIO applies any copied BSCALE/BZERO/BLANK
-    unsafe { sys::ffrdef(header.as_raw(), &mut status) };
-    check_status(status)?;
-    Ok(header)
-}
-
-/// Decompress every plane of the current image of `fptr` to `out`, as stored
-/// big-endian values. Returns the bytes written.
-fn write_planes<T: Pixel + MaybeFloat>(
-    fptr: &mut FitsFile,
+/// Decompress every plane of HDU `index` of `cube` into the data unit of
+/// `out`, at `datastart`, across threads.
+fn write_planes<T: Pixel + NullValue>(
+    cube: &Path,
+    index: usize,
     dims: &[usize],
-    out: &mut impl Write,
-) -> Result<u64> {
-    disable_scaling(fptr)?;
+    out: &File,
+    datastart: u64,
+) -> Result<()> {
     let n_planes: usize = dims[2.min(dims.len())..].iter().product();
-    let mut buf: Vec<T> = Vec::new();
-    let mut written = 0;
-    for plane in 0..n_planes {
-        let mut ranges: Vec<(usize, usize)> = dims.iter().map(|&n| (0, n)).collect();
-        let mut rest = plane;
-        for (axis, &n) in dims.iter().enumerate().skip(2) {
-            ranges[axis] = (rest % n, rest % n + 1);
-            rest /= n;
-        }
-        read_pixels(fptr, Some(&ranges), T::nan_or_none(), &mut buf)?;
-        swap_to_be(&mut buf);
-        out.write_all(as_bytes(&buf))?;
-        written += size_of_val(buf.as_slice()) as u64;
-    }
-    Ok(written)
-}
-
-/// Blank pixels read as NaN for float images, and as stored for integers.
-trait MaybeFloat: Sized {
-    fn nan_or_none() -> Option<Self> {
-        None
-    }
-}
-impl MaybeFloat for u8 {}
-impl MaybeFloat for i16 {}
-impl MaybeFloat for i32 {}
-impl MaybeFloat for i64 {}
-impl MaybeFloat for f32 {
-    fn nan_or_none() -> Option<Self> {
-        Some(Float::nan())
-    }
-}
-impl MaybeFloat for f64 {
-    fn nan_or_none() -> Option<Self> {
-        Some(Float::nan())
-    }
+    let plane_bytes = (dims[..2.min(dims.len())].iter().product::<usize>() * size_of::<T>()) as u64;
+    // Read-only opens get their own CFITSIO handle, so threads can share a file
+    (0..n_planes).into_par_iter().try_for_each_init(
+        || None,
+        |state: &mut Option<(FitsFile, Vec<T>)>, plane| -> Result<()> {
+            let (fptr, buf) = match state {
+                Some(state) => state,
+                None => {
+                    let mut fptr = FitsFile::open(cube)?;
+                    fptr.hdu(index)?;
+                    disable_scaling(&mut fptr)?;
+                    state.insert((fptr, Vec::new()))
+                }
+            };
+            let mut ranges: Vec<(usize, usize)> = dims.iter().map(|&n| (0, n)).collect();
+            let mut rest = plane;
+            for (axis, &n) in dims.iter().enumerate().skip(2) {
+                ranges[axis] = (rest % n, rest % n + 1);
+                rest /= n;
+            }
+            read_pixels(fptr, Some(&ranges), T::null_value(), buf)?;
+            swap_to_be(buf);
+            write_at(out, as_bytes(buf), datastart + plane as u64 * plane_bytes)?;
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

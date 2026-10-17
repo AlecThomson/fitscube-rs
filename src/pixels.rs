@@ -24,3 +24,24 @@ macro_rules! with_pixel_type {
     };
 }
 pub(crate) use with_pixel_type;
+
+/// What blank pixels read as: NaN for floats, and as stored for integers.
+pub(crate) trait NullValue: Sized {
+    fn null_value() -> Option<Self> {
+        None
+    }
+}
+impl NullValue for u8 {}
+impl NullValue for i16 {}
+impl NullValue for i32 {}
+impl NullValue for i64 {}
+impl NullValue for f32 {
+    fn null_value() -> Option<Self> {
+        Some(Self::NAN)
+    }
+}
+impl NullValue for f64 {
+    fn null_value() -> Option<Self> {
+        Some(Self::NAN)
+    }
+}

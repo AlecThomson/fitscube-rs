@@ -3,13 +3,13 @@
 //! Planes are read as raw bytes, their tiles compressed across threads, and the
 //! table and heap written in plane order, so the output does not depend on the
 //! thread count.
-use std::ffi::{CStr, c_char, c_double, c_float, c_int, c_long};
+use std::ffi::{c_double, c_float, c_int, c_long};
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc::sync_channel;
 
-use atfits_rs::{image_shape, is_scaling_keyword, is_structural_keyword, key_bool};
+use atfits_rs::{image_shape, key_bool};
 use fitsio::FitsFile;
 use fitsio::errors::check_status;
 use fitsio::sys::{self, LONGLONG};
@@ -17,6 +17,7 @@ use flate2::{Compression, GzBuilder};
 use rayon::prelude::*;
 
 use crate::error::{FitsCubeError, Result};
+use crate::header::{pad_card, user_cards};
 
 unsafe extern "C" {
     fn fits_init_randoms() -> c_int;
@@ -423,63 +424,6 @@ fn open_source(cube: &Path) -> Result<Source> {
     })
 }
 
-/// The cards of the current header that describe the image rather than its
-/// storage, plain or compressed. BSCALE, BZERO and BLANK are kept if `scaling`.
-pub(crate) fn user_cards(fptr: &mut FitsFile, scaling: bool) -> Result<Vec<u8>> {
-    let mut status = 0;
-    let mut nkeys: c_int = 0;
-    unsafe { sys::ffghsp(fptr.as_raw(), &mut nkeys, std::ptr::null_mut(), &mut status) };
-    check_status(status)?;
-    let mut cards = Vec::new();
-    let mut card = [0 as c_char; 81];
-    for i in 1..=nkeys {
-        unsafe { sys::ffgrec(fptr.as_raw(), i, card.as_mut_ptr(), &mut status) };
-        check_status(status)?;
-        let text = unsafe { CStr::from_ptr(card.as_ptr()) }.to_bytes();
-        let name = card_name(text);
-        if keep_card(name) || (scaling && is_scaling_keyword(name)) {
-            cards.extend_from_slice(&pad_card(text));
-        }
-    }
-    Ok(cards)
-}
-
-/// Whether a card of the image belongs in the compressed table header too.
-fn keep_card(name: &str) -> bool {
-    let reserved = [
-        "ZIMAGE", "ZSIMPLE", "ZEXTEND", "ZBITPIX", "ZCMPTYPE", "ZQUANTIZ", "ZDITHER0", "ZBLANK",
-        "ZSCALE", "ZZERO", "ZTENSION", "ZPCOUNT", "ZGCOUNT", "ZHECKSUM", "ZDATASUM", "XTENSION",
-        "EXTNAME", "TFIELDS", "THEAP", "CHECKSUM", "DATASUM",
-    ];
-    let numbered = [
-        "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "TTYPE", "TFORM", "TUNIT", "TDIM", "TNULL", "TSCAL",
-        "TZERO", "TDISP",
-    ];
-    !(is_structural_keyword(name)
-        || is_scaling_keyword(name)
-        || reserved.contains(&name)
-        || numbered.iter().any(|p| {
-            name.strip_prefix(p)
-                .is_some_and(|n| n.bytes().all(|c| c.is_ascii_digit()))
-        }))
-}
-
-/// Keyword name of a card: the text before the first space or `=`.
-fn card_name(card: &[u8]) -> &str {
-    let end = card
-        .iter()
-        .position(|&b| b == b' ' || b == b'=')
-        .unwrap_or(card.len());
-    std::str::from_utf8(&card[..end]).unwrap_or("")
-}
-
-fn pad_card(text: &[u8]) -> [u8; 80] {
-    let mut card = [b' '; 80];
-    let n = text.len().min(80);
-    card[..n].copy_from_slice(&text[..n]);
-    card
-}
-
 /// A card with a fixed-format value: numbers and logicals right-justified,
 /// strings quoted from column 11.
 fn card(name: &str, value: CardValue) -> [u8; 80] {
@@ -787,16 +731,5 @@ mod tests {
         let tiles: Vec<_> = layout.tiles().collect();
         assert_eq!(tiles, vec![(0, 64, 0, 30), (64, 100, 0, 30)]);
         assert_eq!(layout.tiles_per_plane(), 2);
-    }
-
-    #[test]
-    fn keeps_user_cards_only() {
-        assert!(keep_card("BUNIT"));
-        assert!(keep_card("HISTORY"));
-        assert!(keep_card("ZOOM"));
-        assert!(!keep_card("NAXIS3"));
-        assert!(!keep_card("ZNAXIS2"));
-        assert!(!keep_card("BSCALE"));
-        assert!(!keep_card("CHECKSUM"));
     }
 }

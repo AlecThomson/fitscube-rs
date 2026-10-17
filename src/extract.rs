@@ -2,20 +2,22 @@
 //!
 //! Only the requested plane is read. The output keeps the cube's axes, with the
 //! FREQ/TIME axis of length 1, and takes its beam from the `BEAMS` table.
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use atfits_rs::raw::{Pixel, disable_scaling, read_pixels, write_pixels};
+use atfits_rs::raw::{Pixel, as_bytes, disable_scaling, read_pixels, swap_to_be};
 use atfits_rs::{
-    HeaderGeom, TargetAxis, copy_hdu_header, delete_key, key_bool, resize_image, update_key_f64,
+    HeaderGeom, TargetAxis, delete_key, extract_header_layout, key_bool, update_key_f64,
     update_key_i64,
 };
-use fitsio::errors::check_status;
-use fitsio::{FitsFile, sys};
+use fitsio::FitsFile;
 use rayon::prelude::*;
 
 use crate::beams::{Beam, read_beam_table};
 use crate::combine::{check_exists, in_pool};
 use crate::error::{FitsCubeError, Result};
+use crate::header::plain_header;
 use crate::partial::partial_file;
 use crate::pixels::with_pixel_type;
 use crate::wcs::{find_axis, world};
@@ -286,26 +288,27 @@ fn copy_plane<T: Pixel>(
     disable_scaling(src)?;
     read_pixels(src, Some(&ranges), None, &mut plane)?;
 
-    let mut out = copy_hdu_header(src, path)?;
     let mut dims = cube.geom.dims.clone();
     dims[fi - 1] = 1;
-    resize_image(&mut out, cube.geom.bitpix, &dims)?;
-    update_key_i64(&mut out, &format!("CRPIX{fi}"), 1)?;
-    update_key_f64(&mut out, &format!("CRVAL{fi}"), world(&cube.axis, index))?;
+    let mut header = plain_header(src, cube.geom.bitpix, &dims)?;
+    update_key_i64(&mut header, &format!("CRPIX{fi}"), 1)?;
+    update_key_f64(&mut header, &format!("CRVAL{fi}"), world(&cube.axis, index))?;
     if let Some(b) = beam {
-        update_key_f64(&mut out, "BMAJ", b.major_deg)?;
-        update_key_f64(&mut out, "BMIN", b.minor_deg)?;
-        update_key_f64(&mut out, "BPA", b.pa_deg)?;
+        update_key_f64(&mut header, "BMAJ", b.major_deg)?;
+        update_key_f64(&mut header, "BMIN", b.minor_deg)?;
+        update_key_f64(&mut header, "BPA", b.pa_deg)?;
     }
     if cube.casambm {
-        delete_key(&mut out, "CASAMBM")?;
+        delete_key(&mut header, "CASAMBM")?;
     }
-    disable_scaling(&mut out)?;
-    write_pixels(&mut out, 0, &plane)?;
-    let mut status = 0;
-    // SAFETY: `out` is open; flushing reports write errors that close hides.
-    unsafe { sys::ffflus(out.as_raw(), &mut status) };
-    check_status(status)?;
+    let layout = extract_header_layout(&mut header, &dims)?;
+
+    swap_to_be(&mut plane);
+    let data = as_bytes(&plane);
+    let mut out = File::create(path)?;
+    out.write_all(&layout.header)?;
+    out.write_all(data)?;
+    out.write_all(&vec![0u8; (2880 - data.len() % 2880) % 2880])?;
     Ok(())
 }
 

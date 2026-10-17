@@ -651,13 +651,13 @@ impl CubeWriter<'_> {
 }
 
 #[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
 }
 
 #[cfg(windows)]
-fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match file.seek_write(buf, offset)? {
