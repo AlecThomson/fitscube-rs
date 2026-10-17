@@ -5,7 +5,7 @@
 //! thread count.
 use std::ffi::{CStr, c_char, c_double, c_float, c_int, c_long};
 use std::fs::File;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc::sync_channel;
 
@@ -323,7 +323,7 @@ pub(crate) fn tile_compress(
         seed,
     };
 
-    let mut out = File::create(output)?;
+    let mut out = BufWriter::with_capacity(8 << 20, File::create(output)?);
     out.write_all(&primary_header())?;
     let table_start = out.stream_position()?;
     let mut descriptors = vec![0u8; n_rows * table.row_width()];
@@ -335,47 +335,31 @@ pub(crate) fn tile_compress(
     let mut heap_size = 0usize;
     std::thread::scope(|scope| -> Result<()> {
         let (tx, rx) = sync_channel::<Vec<Vec<Tile>>>(1);
-        let source = &source;
-        let layout = &layout;
-        let producer = scope.spawn(move || -> Result<()> {
-            let mut start = 0;
-            while start < n_planes {
-                let end = (start + batch).min(n_planes);
-                let planes = (start..end)
-                    .into_par_iter()
-                    .map_init(Vec::new, |buf, plane| {
-                        source.read_plane(plane, buf)?;
-                        compress_plane(buf, layout, settings.codec, plane, seed, source.bitpix)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                if tx.send(planes).is_err() {
-                    return Err(FitsCubeError::Cancelled);
-                }
-                start = end;
-            }
-            Ok(())
-        });
-
-        let mut row = 0;
         let width = table.row_width();
-        let writer = (|| -> Result<()> {
+        let rice = table.is_rice();
+        let (out, descriptors) = (&mut out, &mut descriptors);
+        let (heap_size, max_lengths) = (&mut heap_size, &mut max_lengths);
+        let writer = scope.spawn(move || -> Result<()> {
+            let mut row = 0;
             for planes in rx {
                 for tile in planes.into_iter().flatten() {
                     let cells = &mut descriptors[row * width..(row + 1) * width];
-                    for (col, data) in [&tile.data, &tile.gzip_data].into_iter().enumerate() {
-                        if col == 1 && !table.is_rice() {
-                            break;
-                        }
-                        let offset = if data.is_empty() { 0 } else { heap_size };
+                    let columns = if rice { 2 } else { 1 };
+                    for (col, data) in [&tile.data, &tile.gzip_data]
+                        .into_iter()
+                        .enumerate()
+                        .take(columns)
+                    {
+                        let offset = if data.is_empty() { 0 } else { *heap_size };
                         cells[col * 16..col * 16 + 8]
                             .copy_from_slice(&(data.len() as i64).to_be_bytes());
                         cells[col * 16 + 8..col * 16 + 16]
                             .copy_from_slice(&(offset as i64).to_be_bytes());
                         max_lengths[col] = max_lengths[col].max(data.len());
                         out.write_all(data)?;
-                        heap_size += data.len();
+                        *heap_size += data.len();
                     }
-                    if table.is_rice() {
+                    if rice {
                         cells[32..40].copy_from_slice(&tile.scale.to_be_bytes());
                         cells[40..48].copy_from_slice(&tile.zero.to_be_bytes());
                     }
@@ -383,10 +367,28 @@ pub(crate) fn tile_compress(
                 }
             }
             Ok(())
+        });
+
+        // Compressed here rather than in the spawned thread, which would leave
+        // the caller's thread pool
+        let produced = (|| -> Result<()> {
+            for start in (0..n_planes).step_by(batch) {
+                let planes = (start..(start + batch).min(n_planes))
+                    .into_par_iter()
+                    .map_init(Vec::new, |buf, plane| {
+                        source.read_plane(plane, buf)?;
+                        compress_plane(buf, &layout, settings.codec, plane, seed, source.bitpix)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                // A failed writer drops the channel; its error is the one returned
+                if tx.send(planes).is_err() {
+                    return Err(FitsCubeError::Cancelled);
+                }
+            }
+            Ok(())
         })();
-        // A failed writer drops the channel, which cancels the producer
-        let produced = producer.join().map_err(|_| FitsCubeError::WorkerPanic)?;
-        writer?;
+        drop(tx);
+        writer.join().map_err(|_| FitsCubeError::WorkerPanic)??;
         produced
     })?;
 
@@ -396,8 +398,7 @@ pub(crate) fn tile_compress(
     // Same size as the placeholder: only fixed-width values change
     out.write_all(&table.header(heap_size, max_lengths))?;
     out.write_all(&descriptors)?;
-    out.sync_all()?;
-    drop(out);
+    out.into_inner().map_err(|e| e.into_error())?.sync_all()?;
 
     copy_other_hdus(cube, output, &[0])
 }
@@ -412,6 +413,20 @@ fn open_source(cube: &Path) -> Result<Source> {
     unsafe { sys::ffghadll(fptr.as_raw(), &mut head, &mut data, &mut end, &mut status) };
     check_status(status)?;
 
+    Ok(Source {
+        file: File::open(cube)?,
+        data_start: data as u64,
+        dims,
+        bitpix,
+        cards: user_cards(&mut fptr, false)?,
+        extend: key_bool(&mut fptr, "EXTEND")?.unwrap_or(false),
+    })
+}
+
+/// The cards of the current header that describe the image rather than its
+/// storage, plain or compressed. BSCALE, BZERO and BLANK are kept if `scaling`.
+pub(crate) fn user_cards(fptr: &mut FitsFile, scaling: bool) -> Result<Vec<u8>> {
+    let mut status = 0;
     let mut nkeys: c_int = 0;
     unsafe { sys::ffghsp(fptr.as_raw(), &mut nkeys, std::ptr::null_mut(), &mut status) };
     check_status(status)?;
@@ -421,18 +436,12 @@ fn open_source(cube: &Path) -> Result<Source> {
         unsafe { sys::ffgrec(fptr.as_raw(), i, card.as_mut_ptr(), &mut status) };
         check_status(status)?;
         let text = unsafe { CStr::from_ptr(card.as_ptr()) }.to_bytes();
-        if keep_card(card_name(text)) {
+        let name = card_name(text);
+        if keep_card(name) || (scaling && is_scaling_keyword(name)) {
             cards.extend_from_slice(&pad_card(text));
         }
     }
-    Ok(Source {
-        file: File::open(cube)?,
-        data_start: data as u64,
-        dims,
-        bitpix,
-        cards,
-        extend: key_bool(&mut fptr, "EXTEND")?.unwrap_or(false),
-    })
+    Ok(cards)
 }
 
 /// Whether a card of the image belongs in the compressed table header too.
@@ -442,7 +451,10 @@ fn keep_card(name: &str) -> bool {
         "ZSCALE", "ZZERO", "ZTENSION", "ZPCOUNT", "ZGCOUNT", "ZHECKSUM", "ZDATASUM", "XTENSION",
         "EXTNAME", "TFIELDS", "THEAP", "CHECKSUM", "DATASUM",
     ];
-    let numbered = ["ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "TTYPE", "TFORM"];
+    let numbered = [
+        "ZNAXIS", "ZTILE", "ZNAME", "ZVAL", "TTYPE", "TFORM", "TUNIT", "TDIM", "TNULL", "TSCAL",
+        "TZERO", "TDISP",
+    ];
     !(is_structural_keyword(name)
         || is_scaling_keyword(name)
         || reserved.contains(&name)

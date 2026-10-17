@@ -1,13 +1,13 @@
 //! Compress a finished cube with gzip or FITS tile compression (as fpack
 //! does), and turn a compressed cube back into plain FITS.
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::c_int;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use atfits_rs::{
-    Pixel, as_bytes, disable_scaling, extract_header_layout, image_shape, is_structural_keyword,
-    key_f64, key_i64, key_string, read_pixels, swap_to_be, update_key_f64, update_key_logical,
+    Pixel, as_bytes, disable_scaling, extract_header_layout, image_shape, key_f64, key_i64,
+    key_string, read_pixels, swap_to_be, update_key_f64, update_key_i64, update_key_logical,
 };
 use fitsio::FitsFile;
 use fitsio::errors::check_status;
@@ -24,6 +24,7 @@ use crate::partial::partial_file;
 use crate::pixels::with_pixel_type;
 use crate::tile::{
     TileCodec, TileSettings, copy_other_hdus, has_compressed_hdu, image_kind, tile_compress,
+    user_cards,
 };
 
 /// How to compress a cube.
@@ -314,24 +315,9 @@ fn untile_cube(cube: &Path, output: &Path) -> Result<()> {
 /// A new in-memory primary image with the uncompressed header of the current
 /// (compressed) HDU of `fptr`.
 fn image_header(fptr: &mut FitsFile, bitpix: i64, dims: &[usize]) -> Result<FitsFile> {
+    // Not CFITSIO's ffcnvthdr2str, which writes the whole image into memory
+    let cards = user_cards(fptr, bitpix > 0)?;
     let mut status = 0;
-    let mut text: *mut c_char = std::ptr::null_mut();
-    let mut nkeys: c_int = 0;
-    unsafe {
-        sys::ffcnvthdr2str(
-            fptr.as_raw(),
-            0,
-            std::ptr::null_mut(),
-            0,
-            &mut text,
-            &mut nkeys,
-            &mut status,
-        )
-    };
-    check_status(status)?;
-    let cards = unsafe { CStr::from_ptr(text) }.to_bytes().to_vec();
-    unsafe { sys::fffree(text as *mut c_void, &mut status) };
-
     let mut raw: *mut sys::fitsfile = std::ptr::null_mut();
     unsafe { sys::ffinit(&mut raw, c"mem://".as_ptr(), &mut status) };
     check_status(status)?;
@@ -348,16 +334,15 @@ fn image_header(fptr: &mut FitsFile, bitpix: i64, dims: &[usize]) -> Result<Fits
     };
     check_status(status)?;
     for card in cards.chunks(80) {
-        let name = std::str::from_utf8(&card[..8]).unwrap_or("").trim_end();
-        if is_structural_keyword(name)
-            || matches!(name, "XTENSION" | "EXTNAME" | "CHECKSUM" | "DATASUM")
-        {
-            continue;
-        }
         let card =
             std::ffi::CString::new(card).map_err(|e| FitsCubeError::Atfits(e.to_string()))?;
         unsafe { sys::ffprec(header.as_raw(), card.as_ptr(), &mut status) };
         check_status(status)?;
+    }
+    if bitpix > 0
+        && let Some(blank) = key_i64(fptr, "ZBLANK")?
+    {
+        update_key_i64(&mut header, "BLANK", blank)?;
     }
     // Re-read the header so CFITSIO applies any copied BSCALE/BZERO/BLANK
     unsafe { sys::ffrdef(header.as_raw(), &mut status) };
