@@ -31,6 +31,47 @@ Best of 3 runs. Input generation is not timed. Intel Xeon at 2.10 GHz
 The 100 × 1024² row is the median of 5 runs: at this size an occasional run
 stalls on disk write-back.
 
+## Command line, against fitscube 2.10
+
+`scripts/benchmark_cli.py` times the two CLIs, and `fpack`, on the same cube:
+combine, extract one plane, then compress and decompress the cube with 4
+threads. Noise images with a blank top and bottom eighth. Median of 3 runs,
+same machine as above, `fitscube` 2.10.0, `fpack` from CFITSIO 4.3.1. Combine
+on this VM's disk varies by up to 2× between runs, as write-back stalls.
+
+```sh
+python scripts/benchmark_cli.py /scratch --nchan 100 --size 1024
+```
+
+100 × 1024² `float32` (419 MB cube). Wall time, then peak RSS:
+
+| Command                   | `fitscube`      | `fitscubers`   | `fpack` |
+| ------------------------- | --------------: | -------------: | ------: |
+| `combine`                 | 3.00 s, 283 MB  | 0.77 s, 62 MB  |         |
+| `combine --bounding-box`  | 3.72 s, 501 MB  | 0.31 s, 48 MB  |         |
+| `extract`                 | 0.91 s, 113 MB  | 0.01 s, 10 MB  |         |
+| `compress tile-gzip`      | 5.63 s, 182 MB  | 3.47 s, 71 MB  | 11.24 s |
+| `decompress` (tile-gzip)  | 4.72 s, 116 MB  | 0.78 s, 26 MB  |         |
+| `compress tile-rice`      | 3.70 s, 155 MB  | 1.30 s, 68 MB  | 3.79 s  |
+| `decompress` (tile-rice)  | 3.30 s, 117 MB  | 1.57 s, 24 MB  |         |
+
+1000 × 128² `float32` (66 MB cube), where fitscube's per-plane overhead
+shows:
+
+| Command                   | `fitscube` | `fitscubers` | `fpack` |
+| ------------------------- | ---------: | -----------: | ------: |
+| `combine`                 |    11.74 s |       0.13 s |         |
+| `compress tile-gzip`      |     1.66 s |       0.57 s |  6.24 s |
+| `compress tile-rice`      |    17.29 s |       0.25 s |  0.71 s |
+| `decompress` (tile-rice)  |     2.06 s |       0.16 s |         |
+
+On a 144 × 2048² cube (2.4 GB), `combine` took 15 s and 1.4 GB in `fitscube`
+and 2.2 s and 220 MB in `fitscubers`; `extract` took 1.26 s and 0.10 s.
+
+On a 415 MB cube with sky structure, `tile-gzip` gives 147 MB in either tool,
+and `tile-rice` 44.5 MB against fitscube's 43.0 MB (see
+[Algorithm background](algorithms.md)). `fpack` is single-threaded.
+
 ## How combine works
 
 - Headers, WCS and the frequency axis are handled in Rust, so there is no
@@ -42,7 +83,8 @@ stalls on disk write-back.
   `--bounding-box` only the box is read.
 - Planes are read and swapped on reader threads (`--max-workers`, default one
   per core) while one thread writes.
-- `extract` reads one plane, not the whole cube.
+- `extract` reads one plane, not the whole cube, and writes the plane file
+  directly.
 
 ## Against the previous release
 

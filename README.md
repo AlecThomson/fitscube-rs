@@ -12,8 +12,9 @@ is at [docs.rs/fitscube-rs](https://docs.rs/fitscube-rs).
 <!-- SPHINX-START -->
 
 A Rust port of the [`fitscube`](https://github.com/AlecThomson/fitscube) Python
-package. It stacks single-frequency or single-time FITS images into a cube and
-extracts planes from a cube. The frequency or time axis comes from the image
+package. It stacks single-frequency or single-time FITS images into a cube,
+extracts planes from a cube, and compresses cubes with gzip or FITS tile
+compression (as `fpack` does). The frequency or time axis comes from the image
 headers. Per-channel beams go into a CASA `BEAMS` table.
 
 > Note: this is an experiment in LLM-assisted coding with Claude. Do not trust this software as far as you can throw it.

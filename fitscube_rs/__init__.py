@@ -11,6 +11,8 @@ from __future__ import annotations
 from fitscube_rs._fitscube_rs import (
     BoundingBox,
     combine_fits,
+    compress_cube,
+    decompress_cube,
     extract_plane_from_cube,
     extract_planes_from_cube,
     get_common_bounding_box,
@@ -27,6 +29,8 @@ __all__ = [
     "StokesMismatchException",
     "TargetAxisMissingException",
     "combine_fits",
+    "compress_cube",
+    "decompress_cube",
     "extract_plane_from_cube",
     "extract_planes_from_cube",
     "get_common_bounding_box",
