@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use crate::combine::{in_pool, write_at};
 use crate::error::{FitsCubeError, Result};
 use crate::header::plain_header;
-use crate::partial::partial_file;
+use crate::partial::{partial_file, same_file};
 use crate::pixels::{NullValue, with_pixel_type};
 use crate::tile::{
     TileCodec, TileSettings, copy_other_hdus, has_compressed_hdu, image_kind, tile_compress,
@@ -238,6 +238,9 @@ pub fn decompress_cube(cube: &Path, opts: &DecompressOptions) -> Result<PathBuf>
         None if has_compressed_suffix(cube) => cube.with_extension(""),
         None => return Err(FitsCubeError::NoOutputName(cube.to_path_buf())),
     };
+    if same_file(cube, &output) {
+        return Err(FitsCubeError::OutputIsInput(output));
+    }
     if output.exists() && !opts.overwrite {
         return Err(FitsCubeError::OutputExists(output));
     }

@@ -7,7 +7,16 @@ use crate::error::Result;
 
 /// An empty, uniquely named file beside `target`. It is deleted on drop unless
 /// persisted onto `target`, so a failed write leaves nothing behind.
+///
+/// Any existing `target` is removed first: callers have already decided to
+/// replace it.
 pub(crate) fn partial_file(target: &Path) -> Result<TempPath> {
+    // On ext4, renaming over a large file at the end stalls for seconds while
+    // the new one is flushed; removing the old one up front avoids that
+    match std::fs::remove_file(target) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     let dir = target
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -23,6 +32,11 @@ pub(crate) fn partial_file(target: &Path) -> Result<TempPath> {
     builder.permissions(std::os::unix::fs::PermissionsExt::from_mode(0o666));
     let file = builder.tempfile_in(dir)?;
     Ok(file.into_temp_path())
+}
+
+/// Whether `a` and `b` are the same existing file.
+pub(crate) fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 #[cfg(test)]
@@ -42,6 +56,11 @@ mod tests {
         partial_file(&target).unwrap().persist(&target).unwrap();
         assert!(target.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // An existing target is gone as soon as the partial file exists
+        let partial = partial_file(&target).unwrap();
+        assert!(!target.exists());
+        partial.persist(&target).unwrap();
     }
 
     #[cfg(unix)]

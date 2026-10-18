@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import resource
 import shutil
 import subprocess
@@ -50,6 +51,9 @@ def run(cmd: list[str]) -> tuple[float, float, float]:
     The peak is sampled from VmHWM, as a child's rusage keeps this process's
     own size across exec.
     """
+    # Start with nothing waiting to be written, so a run does not pay for the
+    # previous command's write-back
+    os.sync()
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     start = time.perf_counter()
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

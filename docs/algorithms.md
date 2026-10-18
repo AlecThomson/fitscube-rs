@@ -22,7 +22,8 @@ say) as long as they sit below the combine axis: each channel is written at a
 fixed offset, so the frequency or time axis must vary slowest.
 
 The cube is written to a hidden file next to the output and renamed into
-place at the end, so a failed combine leaves no partial cube.
+place at the end, so a failed combine leaves no partial cube. With `--overwrite`
+an existing output is removed before writing starts, as in fitscube.
 
 ## Frequency and time
 

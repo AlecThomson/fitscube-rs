@@ -478,3 +478,18 @@ fn table_header_never_grows_past_its_placeholder() {
         }
     }
 }
+
+#[test]
+fn decompress_cannot_overwrite_its_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, _) = cube(dir.path());
+    let compressed = compress_cube(&path, &options(CompressMethod::TileGzip)).unwrap();
+    let opts = DecompressOptions {
+        output: Some(compressed.clone()),
+        overwrite: true,
+        ..DecompressOptions::default()
+    };
+    let err = decompress_cube(&compressed, &opts).unwrap_err();
+    assert!(matches!(err, FitsCubeError::OutputIsInput(_)), "{err}");
+    assert!(compressed.exists());
+}
