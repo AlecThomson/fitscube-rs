@@ -1,0 +1,83 @@
+name: Benchmark
+
+# Re-measures fitscube-rs against fitscube and fpack, rewrites the tables in
+# docs/performance.md, and pushes them to the benchmarks/update branch. The job
+# summary links to open a PR from it.
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # On a release, measure the tag; the PR targets the default branch.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # fitscube >= 2.11 needs Python >= 3.11.
+          python-version: "3.13"
+
+      - name: Install fpack
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: fpack
+          create-args: cfitsio
+          condarc: |
+            channels:
+              - conda-forge
+
+      # Only fpack is wanted from the conda env, not its Python.
+      - name: Put fpack on PATH
+        run: echo "$MAMBA_ROOT_PREFIX/envs/fpack/bin" >> "$GITHUB_PATH"
+
+      - name: Build extension and install fitscube
+        run: uv sync --extra test
+
+      - name: Build the CLI
+        run: cargo build --release --bin fitscubers
+
+      - name: Run benchmarks
+        run: >-
+          uv run --no-sync python scripts/update_performance.py
+          --workdir "$RUNNER_TEMP/bench"
+          --fitscubers target/release/fitscubers
+          --summary "$GITHUB_STEP_SUMMARY"
+
+      # Pushing a branch needs only contents: write. Opening the PR from here would
+      # need the repository to let Actions create pull requests.
+      - name: Push the new numbers
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C benchmarks/update
+          git add docs/performance.md
+          if git diff --cached --quiet; then
+            echo "The numbers did not change." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "Refresh benchmark numbers from run ${{ github.run_id }}"
+          git push --force origin benchmarks/update
+          url="${{ github.server_url }}/${{ github.repository }}/compare/${{ github.event.repository.default_branch }}...benchmarks/update?expand=1"
+          echo "New numbers are on \`benchmarks/update\`: [open a PR]($url). Shared runners are noisy, so check the ratios look sensible before merging." >> "$GITHUB_STEP_SUMMARY"
