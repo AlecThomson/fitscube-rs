@@ -71,31 +71,25 @@ def run(cmd: list[str]) -> tuple[float, float, float]:
     return wall, cpu, peak / 1e3
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("workdir", type=Path)
-    parser.add_argument("--nchan", type=int, default=100)
-    parser.add_argument("--size", type=int, default=1024)
-    parser.add_argument("--int16", action="store_true", help="Scaled int16 inputs")
-    parser.add_argument("--repeat", type=int, default=3, help="Median of N runs")
-    parser.add_argument("--fitscubers", default="fitscubers")
-    parser.add_argument("--fitscube", default="fitscube")
-    args = parser.parse_args()
-
-    kind = "int16" if args.int16 else "float32"
-    files = make_images(
-        args.workdir / f"in_{args.nchan}x{args.size}_{kind}",
-        args.nchan,
-        args.size,
-        args.int16,
-    )
-    tools = {"fitscube": args.fitscube, "fitscubers": args.fitscubers}
+def run_cli_benchmark(
+    workdir: Path,
+    nchan: int,
+    size: int,
+    repeat: int = 3,
+    fitscube: str = "fitscube",
+    fitscubers: str = "fitscubers",
+    int16: bool = False,
+) -> list[tuple]:
+    """Time each command and return (case, tool, wall_s, cpu_s, peak_rss_mb) rows."""
+    kind = "int16" if int16 else "float32"
+    files = make_images(workdir / f"in_{nchan}x{size}_{kind}", nchan, size, int16)
+    tools = {"fitscube": fitscube, "fitscubers": fitscubers}
     rows = []
 
     def record(case: str, tool: str, cmd: list[str], setup=None) -> None:
-        """The run with the median wall time, of `args.repeat`."""
+        """The run with the median wall time, of `repeat`."""
         runs = []
-        for _ in range(args.repeat):
+        for _ in range(repeat):
             if setup:
                 setup()
             runs.append(run(cmd))
@@ -105,14 +99,14 @@ def main() -> None:
 
     print("case,tool,wall_s,cpu_s,peak_rss_mb")
     for tool, exe in tools.items():
-        cube = args.workdir / f"{tool}.fits"
-        for extra in ([], ["--bounding-box"]) if not args.int16 else ([],):
+        cube = workdir / f"{tool}.fits"
+        for extra in ([], ["--bounding-box"]) if not int16 else ([],):
             record(
                 " ".join(["combine", *extra]),
                 tool,
                 [exe, "combine", *map(str, files), str(cube), "--overwrite", *extra],
             )
-        plane = args.workdir / f"{tool}.plane.fits"
+        plane = workdir / f"{tool}.plane.fits"
         record(
             "extract",
             tool,
@@ -121,13 +115,13 @@ def main() -> None:
                 "extract",
                 str(cube),
                 "--channel-index",
-                str(args.nchan // 2),
+                str(nchan // 2),
                 "--output-path",
                 str(plane),
                 "--overwrite",
             ],
         )
-        if args.int16:
+        if int16:
             continue
         for method in ("tile-gzip", "tile-rice"):
             record(
@@ -136,7 +130,7 @@ def main() -> None:
                 [exe, "compress", str(cube), "--method", method, "--max-workers", "4"],
             )
             compressed = cube.with_name(cube.name + ".fz")
-            restored = args.workdir / f"{tool}.restored.fits"
+            restored = workdir / f"{tool}.restored.fits"
             record(
                 f"decompress {method}",
                 tool,
@@ -151,9 +145,9 @@ def main() -> None:
             )
             compressed.unlink()
 
-    if shutil.which("fpack") and not args.int16:
-        cube = args.workdir / "fitscubers.fits"
-        copy = args.workdir / "fpack.fits"
+    if shutil.which("fpack") and not int16:
+        cube = workdir / "fitscubers.fits"
+        copy = workdir / "fpack.fits"
         compressed = copy.with_name(copy.name + ".fz")
 
         def fresh_copy() -> None:
@@ -170,6 +164,28 @@ def main() -> None:
                 ["fpack", *flags, "-D", "-Y", str(copy)],
                 fresh_copy,
             )
+    return rows
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("workdir", type=Path)
+    parser.add_argument("--nchan", type=int, default=100)
+    parser.add_argument("--size", type=int, default=1024)
+    parser.add_argument("--int16", action="store_true", help="Scaled int16 inputs")
+    parser.add_argument("--repeat", type=int, default=3, help="Median of N runs")
+    parser.add_argument("--fitscubers", default="fitscubers")
+    parser.add_argument("--fitscube", default="fitscube")
+    args = parser.parse_args()
+    run_cli_benchmark(
+        args.workdir,
+        args.nchan,
+        args.size,
+        args.repeat,
+        args.fitscube,
+        args.fitscubers,
+        args.int16,
+    )
 
 
 if __name__ == "__main__":

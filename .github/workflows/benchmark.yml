@@ -1,0 +1,80 @@
+name: Benchmark
+
+# Re-measures fitscube-rs against fitscube and fpack, rewrites the tables in
+# docs/performance.md, and opens a PR with the result for review.
+# Needs "Allow GitHub Actions to create and approve pull requests" enabled in
+# the repository's Actions settings.
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      # On a release, measure the tag; the PR targets the default branch.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # fitscube >= 2.11 needs Python >= 3.11.
+          python-version: "3.13"
+
+      - name: Install fpack
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: fpack
+          create-args: cfitsio
+          condarc: |
+            channels:
+              - conda-forge
+
+      # Only fpack is wanted from the conda env, not its Python.
+      - name: Put fpack on PATH
+        run: echo "$MAMBA_ROOT_PREFIX/envs/fpack/bin" >> "$GITHUB_PATH"
+
+      - name: Build extension and install fitscube
+        run: uv sync --extra test
+
+      - name: Build the CLI
+        run: cargo build --release --bin fitscubers
+
+      - name: Run benchmarks
+        run: >-
+          uv run --no-sync python scripts/update_performance.py
+          --workdir "$RUNNER_TEMP/bench"
+          --fitscubers target/release/fitscubers
+          --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Open a PR with the new numbers
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: benchmarks/update
+          base: ${{ github.event.repository.default_branch }}
+          add-paths: docs/performance.md
+          commit-message: Refresh benchmark numbers
+          title: Refresh benchmark numbers
+          body: |
+            New numbers from the [Benchmark run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) on `${{ github.ref_name }}`.
+            Shared runners are noisy: check that the ratios look sensible before merging.
