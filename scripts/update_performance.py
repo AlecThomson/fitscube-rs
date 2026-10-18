@@ -42,7 +42,9 @@ def machine() -> str:
     ).stdout.strip()
     fpack = ""
     if shutil.which("fpack"):
-        out = subprocess.run(["fpack", "-V"], capture_output=True, text=True).stdout
+        out = subprocess.run(
+            ["fpack", "-V"], capture_output=True, text=True, check=False
+        ).stdout
         fpack = f", `fpack` {out.split('CFITSIO version')[-1].strip()} (CFITSIO)"
     return (
         f"Measured {datetime.datetime.now(datetime.timezone.utc).date()} on "
