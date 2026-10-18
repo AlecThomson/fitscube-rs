@@ -8,6 +8,7 @@ bug in `fitscube_rs`.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
 import numpy as np
@@ -72,7 +73,7 @@ def _make_freq_images(d: Path, freqs, beams=None) -> list[Path]:
 
 
 # WCS cards that define the new cube axis; these must match exactly (numerically).
-SPECTRAL_CARDS = ["NAXIS", "NAXIS3", "CTYPE3", "CRPIX3", "CRVAL3", "CDELT3"]
+SPECTRAL_CARDS = ["NAXIS", "NAXIS3", "CTYPE3", "CRPIX3", "CRVAL3", "CDELT3", "CSYER3"]
 
 
 def _compare_cubes(ref: Path, rs: Path) -> None:
@@ -129,6 +130,45 @@ def test_uneven_frequency_combine_with_blanks(tmp_path):
         [str(f) for f in rs_files], str(rs_cube), overwrite=True, create_blanks=True
     )
 
+    _compare_cubes(ref_cube, rs_cube)
+
+
+@pytest.mark.parametrize("jitter", [0.0, 0.25])
+def test_racs_all_uneven_bins(tmp_path, jitter):
+    """Images of uneven width over RACS-low3, -mid and -high, with the gaps
+    between the bands, as wsclean labels them. fitscube 2.10 refused these."""
+    starts, counts = [0, 496, 712], [288, 144, 288]
+    index = np.concatenate(
+        [s + np.arange(c) for s, c in zip(starts, counts, strict=True)]
+    )
+    channels = 799.5e6 + 0.5e6 + index * 1e6
+    rng = np.random.default_rng(0)
+    bins, start = [], 0
+    while start < len(channels):
+        end = min(len(channels), start + int(rng.integers(15, 26)))
+        bins.append((start, end - 1))
+        start = end
+    freqs = [(channels[a] + channels[b]) / 2 for a, b in bins]
+    freqs += rng.uniform(-jitter, jitter, len(freqs))
+
+    files = []
+    for i, freq in enumerate(freqs):
+        files.append(tmp_path / f"img_{i}.fits")
+        _write_image(files[-1], fill=float(i + 1), reffreq=freq, ny=4, nx=4)
+    rs_cube = tmp_path / "rs_cube.fits"
+    fitscube_rs.combine_fits(
+        [str(f) for f in files], str(rs_cube), overwrite=True, create_blanks=True
+    )
+    header = fits.getheader(rs_cube)
+    assert header["CDELT3"] == pytest.approx(0.5e6, abs=1e-3)
+    assert (header["CSYER3"] > 0.01) == (jitter > 0)
+
+    if not hasattr(importlib.import_module("fitscube.combine_fits"), "fit_grid"):
+        pytest.skip(f"fitscube {fitscube.__version__} refuses these grids")
+    ref_cube = tmp_path / "ref_cube.fits"
+    fitscube.combine_fits(
+        file_list=files, out_cube=ref_cube, overwrite=True, create_blanks=True
+    )
     _compare_cubes(ref_cube, rs_cube)
 
 

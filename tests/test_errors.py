@@ -58,7 +58,9 @@ def test_shape_mismatch(images, tmp_path):
 
 
 def test_irregular_spacing(tmp_path):
-    offsets = [0.0, 1.0, 1.0 + np.sqrt(2)]
+    # Irrational offsets with no common step. Three values are not enough:
+    # 1 + sqrt(2) is within 1 Hz of 2378 / 985, which fits a grid.
+    offsets = [0.0, np.log(10), np.e, 2 * np.sqrt(2), np.pi, 1.5 * np.e]
     files = [
         _image(tmp_path / f"p{i}.fits", 1e9 + 1e7 * f) for i, f in enumerate(offsets)
     ]

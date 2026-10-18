@@ -49,10 +49,16 @@ the headers. NaN or infinite values are an error.
   CLI writes them to `OUT_CUBE.specs_Hz.txt` (or `.specs_s.txt`).
 
 With `--create-blanks`, fitscube-rs builds a regular grid through the sorted
-values instead, with the step taken as the greatest common divisor of the gaps,
-and fills the grid points that have no input with NaN planes. The combine is
-refused if an input would fall between grid points, if two inputs share one,
-or if the grid would need more than 1000 channels per input.
+values instead, and fills the grid points that have no input with NaN planes.
+The step divides the smallest gap, so it tries that gap over 1, 2, 3... and
+fits each step to every input, keeping the first that puts every input within
+about 1 Hz at 1 GHz (0.5 s for times) of a grid point. Images of uneven width,
+or either side of a gap between bands, still make one cube.
+
+An input that is on the grid only within that tolerance is kept with a warning,
+and `CSYERi` (the FITS systematic error of the axis) records the largest offset,
+with a `HISTORY` card. The combine is refused if two inputs share a grid point,
+or if no grid of at most 1000 channels per input holds every input.
 
 ## Per-channel beams (`BEAMS` table)
 

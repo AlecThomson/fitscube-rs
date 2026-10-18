@@ -1104,6 +1104,42 @@ fn cli_compress() {
     assert!(dir.path().join("cube.specs_Hz.txt").exists());
 }
 
+/// CSYERi holds how far an input sits from the plane it was written to.
+#[test]
+fn grid_offset_is_recorded() {
+    for jitter in [0.0, 0.3] {
+        let dir = tempfile::tempdir().unwrap();
+        let freqs = [1e9, 1e9 + 1e6 + jitter, 1e9 + 3e6];
+        let files = make_planes(dir.path(), "offset", &freqs, |i| Plane {
+            value: i as f64,
+            ..Default::default()
+        });
+        let out_cube = dir.path().join("cube.fits");
+        let opts = CombineOptions {
+            create_blanks: true,
+            ..options()
+        };
+        combine_fits(&files, &out_cube, &opts).unwrap();
+
+        let mut f = FitsFile::open(out_cube.to_string_lossy().as_ref()).unwrap();
+        let hdu = f.primary_hdu().unwrap();
+        let ctype: String = hdu.read_key(&mut f, "CTYPE4").unwrap();
+        assert_eq!(ctype, "FREQ");
+        let error: f64 = hdu.read_key(&mut f, "CSYER4").unwrap();
+        // The grid is fitted to all inputs, so the offset is shared out among them
+        assert!(error <= jitter + 1e-6, "{error}");
+        assert_eq!(error > 0.1, jitter > 0.0, "{error}");
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    let out_cube = dir.path().join("cube.fits");
+    combine_fits(&files, &out_cube, &options()).unwrap();
+    let mut f = FitsFile::open(out_cube.to_string_lossy().as_ref()).unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    assert!(hdu.read_key::<f64>(&mut f, "CSYER4").is_err());
+}
+
 // fitscube 2.9 header fixes
 
 fn read_f64(path: &Path, key: &str) -> f64 {
