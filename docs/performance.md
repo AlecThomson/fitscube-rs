@@ -4,73 +4,85 @@
 [`fitscube`](https://github.com/AlecThomson/fitscube). The parity tests
 compare data, axis cards and beam tables.
 
-## Benchmark
+The tables below are written by `scripts/update_performance.py`, which the
+`Benchmark` workflow runs on a GitHub-hosted runner for each release. Shared
+runners are noisy, so trust the ratios more than the absolute times.
+
+<!-- benchmark:machine -->
+Measured 2026-10-18 on Intel(R) Xeon(R) Processor @ 2.10GHz (4 cores), 16 GB RAM, Linux. `fitscube-rs` v2.0.2-2-g22038c1, `fitscube` 2.11.0, `astropy` 8.0.0, `numpy` 2.4.6, `fpack` 4.030 (CFITSIO).
+<!-- /benchmark:machine -->
+
+To refresh them locally:
+
+```sh
+python scripts/update_performance.py --workdir /scratch
+```
+
+## Python API
 
 `scripts/benchmark.py` writes `nchan` single-channel `float32` FITS images,
 times `combine_fits` for both implementations on the same inputs, and checks
-that the two cubes agree.
+that the two cubes agree. Best of 5 runs; input generation is not timed.
 
 ```sh
 python scripts/benchmark.py --nchan 100 --size 256 --repeat 3
 ```
 
-Best of 3 runs. Input generation is not timed. Intel Xeon at 2.10 GHz
-(4 vCPUs, KVM), 16 GB RAM, Linux, ext4 disk. `fitscube` 2.8.0, `astropy`
-8.0.0, `numpy` 2.4.6.
+<!-- benchmark:api -->
+| Channels × image | Cube size | `fitscube` (py) | `fitscube-rs` | Speedup |
+| ---------------- | --------: | --------------: | ------------: | ------: |
+| 50 × 128² | 3 MB | 0.555 s | 0.004 s | 140× |
+| 100 × 256² | 26 MB | 1.101 s | 0.013 s | 85× |
+| 100 × 512² | 105 MB | 1.070 s | 0.048 s | 22× |
+| 200 × 256² | 52 MB | 2.074 s | 0.026 s | 80× |
+| 500 × 256² | 131 MB | 5.060 s | 0.074 s | 69× |
+| 1000 × 128² | 66 MB | 10.170 s | 0.054 s | 187× |
+| 100 × 1024² | 419 MB | 1.123 s | 0.375 s | 3.0× |
+<!-- /benchmark:api -->
 
-| Channels × image | Cube size | `fitscube` (py) | `fitscube-rs` | Speedup  |
-| ---------------- | --------: | --------------: | ------------: | -------: |
-| 50 × 128²        |      3 MB |         0.466 s |       0.004 s |     108× |
-| 100 × 256²       |     26 MB |         0.906 s |       0.014 s |      66× |
-| 100 × 512²       |    105 MB |         0.922 s |       0.050 s |      18× |
-| 200 × 256²       |     52 MB |         1.713 s |       0.026 s |      66× |
-| 500 × 256²       |    131 MB |         4.251 s |       0.065 s |      65× |
-| 1000 × 128²      |     66 MB |         8.535 s |       0.064 s |     133× |
-| 100 × 1024²      |    419 MB |         0.975 s |        0.13 s |     7.6× |
-
-The 100 × 1024² row is the median of 5 runs: at this size an occasional run
-stalls on disk write-back.
-
-## Command line, against fitscube 2.10
+## Command line
 
 `scripts/benchmark_cli.py` times the two CLIs, and `fpack`, on the same cube:
 combine, extract one plane, then compress and decompress the cube with 4
-threads. Noise images with a blank top and bottom eighth. Median of 3 runs,
-same machine as above, `fitscube` 2.10.0, `fpack` from CFITSIO 4.3.1. Combine
-on this VM's disk varies by up to 2× between runs, as write-back stalls.
+threads. Noise images with a blank top and bottom eighth. Median of 5 runs.
+Wall time, then peak RSS; `fpack` is wall time only, and single-threaded.
 
 ```sh
 python scripts/benchmark_cli.py /scratch --nchan 100 --size 1024
 ```
 
-100 × 1024² `float32` (419 MB cube). Wall time, then peak RSS:
+100 × 1024² `float32` (419 MB cube):
 
-| Command                   | `fitscube`      | `fitscubers`   | `fpack` |
-| ------------------------- | --------------: | -------------: | ------: |
-| `combine`                 | 3.00 s, 283 MB  | 0.77 s, 62 MB  |         |
-| `combine --bounding-box`  | 3.72 s, 501 MB  | 0.31 s, 48 MB  |         |
-| `extract`                 | 0.91 s, 113 MB  | 0.01 s, 10 MB  |         |
-| `compress tile-gzip`      | 5.63 s, 182 MB  | 3.47 s, 71 MB  | 11.24 s |
-| `decompress` (tile-gzip)  | 4.72 s, 116 MB  | 0.78 s, 26 MB  |         |
-| `compress tile-rice`      | 3.70 s, 155 MB  | 1.30 s, 68 MB  | 3.79 s  |
-| `decompress` (tile-rice)  | 3.30 s, 117 MB  | 1.57 s, 24 MB  |         |
+<!-- benchmark:cli-100x1024 -->
+| Command | `fitscube` | `fitscubers` | `fpack` |
+| ------- | ---------: | -----------: | ------: |
+| `combine` | 2.23 s, 265 MB | 0.73 s, 62 MB |  |
+| `combine --bounding-box` | 3.00 s, 506 MB | 0.33 s, 49 MB |  |
+| `extract` | 0.97 s, 112 MB | 0.01 s, 10 MB |  |
+| `compress tile-gzip` | 5.63 s, 183 MB | 3.41 s, 76 MB | 10.88 s |
+| `decompress` (tile-gzip) | 4.18 s, 115 MB | 0.86 s, 26 MB |  |
+| `compress tile-rice` | 3.72 s, 154 MB | 1.28 s, 60 MB | 3.73 s |
+| `decompress` (tile-rice) | 3.31 s, 115 MB | 0.72 s, 24 MB |  |
+<!-- /benchmark:cli-100x1024 -->
 
 1000 × 128² `float32` (66 MB cube), where fitscube's per-plane overhead
 shows:
 
-| Command                   | `fitscube` | `fitscubers` | `fpack` |
-| ------------------------- | ---------: | -----------: | ------: |
-| `combine`                 |    11.74 s |       0.13 s |         |
-| `compress tile-gzip`      |     1.66 s |       0.57 s |  6.24 s |
-| `compress tile-rice`      |    17.29 s |       0.25 s |  0.71 s |
-| `decompress` (tile-rice)  |     2.06 s |       0.16 s |         |
-
-On a 144 × 2048² cube (2.4 GB), `combine` took 15 s and 1.4 GB in `fitscube`
-and 2.2 s and 220 MB in `fitscubers`; `extract` took 1.26 s and 0.10 s.
+<!-- benchmark:cli-1000x128 -->
+| Command | `fitscube` | `fitscubers` | `fpack` |
+| ------- | ---------: | -----------: | ------: |
+| `combine` | 11.14 s, 127 MB | 0.11 s, 11 MB |  |
+| `combine --bounding-box` | 13.25 s, 190 MB | 0.14 s, 11 MB |  |
+| `extract` | 0.88 s, 106 MB | 0.01 s, — |  |
+| `compress tile-gzip` | 1.61 s, 109 MB | 0.42 s, 19 MB | 6.41 s |
+| `decompress` (tile-gzip) | 2.11 s, 106 MB | 0.19 s, 9 MB |  |
+| `compress tile-rice` | 17.63 s, 109 MB | 0.22 s, 16 MB | 0.67 s |
+| `decompress` (tile-rice) | 1.76 s, 106 MB | 0.14 s, 9 MB |  |
+<!-- /benchmark:cli-1000x128 -->
 
 On a 415 MB cube with sky structure, `tile-gzip` gives 147 MB in either tool,
 and `tile-rice` 44.5 MB against fitscube's 43.0 MB (see
-[Algorithm background](algorithms.md)). `fpack` is single-threaded.
+[Algorithm background](algorithms.md)).
 
 ## How combine works
 
@@ -86,33 +98,8 @@ and `tile-rice` 44.5 MB against fitscube's 43.0 MB (see
 - `extract` reads one plane, not the whole cube, and writes the plane file
   directly.
 
-## Against the previous release
-
-200 × 1024² `float32` images (800 MB cube), 4 cores, median of 4 runs. The CLI
-on `main` before #9 against #9 (single header pass and plane reads). Combine
-ran on tmpfs; extract on disk with a warm cache.
-
-| Command                       | Before | After  |
-| ----------------------------- | -----: | -----: |
-| `combine`                     | 0.73 s | 0.44 s |
-| `combine --bounding-box`      | 1.40 s | 0.80 s |
-| `extract --channel-index 100` | 2.6 s  | 0.02 s |
-
 ## Memory
 
 `fitscube-rs` streams: at most about three planes per reader thread are in
-memory, never the whole cube.
-
-Peak RSS of the combine alone, from `/usr/bin/time -v`, median of 3 runs, on
-the hardware above. Inputs were generated in a separate process.
-
-| Channels × image | Cube size | `fitscube` (py) | `fitscube-rs` (CLI) | `fitscube-rs` (Python) |
-| ---------------- | --------: | --------------: | ------------------: | ---------------------: |
-| 200 × 512²       |    210 MB |          131 MB |               22 MB |                  29 MB |
-| 100 × 1024²      |    419 MB |          241 MB |               63 MB |                  70 MB |
-
-`fitscube` memmaps the output cube; `fitscube-rs` writes each plane with
-positional writes. On a 26 GB cube (420 × 4096²) on a 24 GB machine, measured
-before `fitscube-rs` 2.0 and not re-measured here, `fitscube` took 78 s with a
-23.5 GB peak footprint and `fitscube-rs` took 19 s with 2.6 GB. At that
-version `--max-workers` only limited the plane queue.
+memory, never the whole cube. `fitscube` memmaps the output cube;
+`fitscube-rs` writes each plane with positional writes.
