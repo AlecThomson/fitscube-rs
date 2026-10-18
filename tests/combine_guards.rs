@@ -1103,3 +1103,91 @@ fn cli_compress() {
     assert_eq!(read_planes(&dir.path().join("cube.fits.gz")).len(), 4);
     assert!(dir.path().join("cube.specs_Hz.txt").exists());
 }
+
+// fitscube 2.9 header fixes
+
+fn read_f64(path: &Path, key: &str) -> f64 {
+    let mut f = FitsFile::open(path.to_string_lossy().as_ref()).unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    hdu.read_key(&mut f, key).unwrap()
+}
+
+fn read_str(path: &Path, key: &str) -> String {
+    let mut f = FitsFile::open(path.to_string_lossy().as_ref()).unwrap();
+    let hdu = f.primary_hdu().unwrap();
+    hdu.read_key(&mut f, key).unwrap()
+}
+
+/// A CD matrix replaces CDELT, so the cube's spectral CD element must hold the
+/// step. It used to be set to 1, so every channel decoded 1 Hz apart.
+#[test]
+fn cd_matrix_carries_the_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = file_list(dir.path());
+    for file in &files {
+        let mut f = FitsFile::edit(file.to_string_lossy().as_ref()).unwrap();
+        update_key_f64(&mut f, "CD1_1", -1e-3).unwrap();
+        update_key_f64(&mut f, "CD2_2", 1e-3).unwrap();
+        delete_key(&mut f, "CDELT1").unwrap();
+        delete_key(&mut f, "CDELT2").unwrap();
+    }
+    let out = dir.path().join("cube.fits");
+    combine_fits(&files, &out, &options()).unwrap();
+    assert_eq!(read_f64(&out, "CD4_4"), 1e6);
+    assert_eq!(read_f64(&out, "CDELT4"), 1e6);
+}
+
+/// Time-domain inputs at 1 s steps, carrying their own (wrong) time reference.
+fn time_file_list(dir: &Path) -> Vec<PathBuf> {
+    let files = file_list(dir);
+    for (i, file) in files.iter().enumerate() {
+        let mut f = FitsFile::edit(file.to_string_lossy().as_ref()).unwrap();
+        update_key_str(&mut f, "DATE-OBS", &format!("2024-01-01T00:00:0{i}")).unwrap();
+        update_key_f64(&mut f, "MJDREF", 51544.0).unwrap();
+        update_key_f64(&mut f, "MJDREFI", 51544.0).unwrap();
+        update_key_str(&mut f, "TIMESYS", "TT").unwrap();
+    }
+    files
+}
+
+/// The TIME axis holds UTC MJD seconds, so the cube must say so whatever the
+/// inputs used.
+#[test]
+fn time_axis_reference_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = time_file_list(dir.path());
+    let out = dir.path().join("cube.fits");
+    let opts = CombineOptions {
+        time_domain_mode: true,
+        ..options()
+    };
+    combine_fits(&files, &out, &opts).unwrap();
+    assert_eq!(read_f64(&out, "MJDREF"), 0.0);
+    assert_eq!(read_str(&out, "TIMESYS"), "UTC");
+    let mut f = FitsFile::open(out.to_string_lossy().as_ref()).unwrap();
+    assert!(!atfits_rs::key_exists(&mut f, "MJDREFI").unwrap());
+    assert_eq!(read_str(&out, "CTYPE5"), "TIME");
+}
+
+/// A time cube keeps its inputs' one-plane FREQ axis, so it must be split
+/// along TIME and the planes named by timestep.
+#[test]
+fn extract_planes_splits_time_cubes() {
+    use fitscube_rs::extract::{ExtractPlanesOptions, extract_planes_from_cube};
+
+    let dir = tempfile::tempdir().unwrap();
+    let files = time_file_list(dir.path());
+    let out = dir.path().join("cube.fits");
+    let opts = CombineOptions {
+        time_domain_mode: true,
+        ..options()
+    };
+    combine_fits(&files, &out, &opts).unwrap();
+    let planes = extract_planes_from_cube(&out, &ExtractPlanesOptions::default()).unwrap();
+    assert_eq!(planes.len(), 4);
+    for (i, plane) in planes.iter().enumerate() {
+        assert_eq!(plane, &dir.path().join(format!("cube.timestep-{i}.fits")));
+        assert!(read_planes(plane).iter().all(|p| all_eq(p, i as f64)));
+        assert_eq!(read_i64(plane, "NAXIS5"), 1);
+    }
+}

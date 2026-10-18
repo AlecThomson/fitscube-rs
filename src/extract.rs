@@ -2,20 +2,22 @@
 //!
 //! Only the requested plane is read. The output keeps the cube's axes, with the
 //! FREQ/TIME axis of length 1, and takes its beam from the `BEAMS` table.
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use atfits_rs::raw::{Pixel, disable_scaling, read_pixels, write_pixels};
+use atfits_rs::raw::{Pixel, as_bytes, disable_scaling, read_pixels, swap_to_be};
 use atfits_rs::{
-    HeaderGeom, TargetAxis, copy_hdu_header, delete_key, key_bool, resize_image, update_key_f64,
+    HeaderGeom, TargetAxis, delete_key, extract_header_layout, key_bool, update_key_f64,
     update_key_i64,
 };
-use fitsio::errors::check_status;
-use fitsio::{FitsFile, sys};
+use fitsio::FitsFile;
 use rayon::prelude::*;
 
 use crate::beams::{Beam, read_beam_table};
 use crate::combine::{check_exists, in_pool};
 use crate::error::{FitsCubeError, Result};
+use crate::header::plain_header;
 use crate::partial::partial_file;
 use crate::pixels::with_pixel_type;
 use crate::wcs::{find_axis, world};
@@ -82,9 +84,14 @@ fn create_target_index(opts: &ExtractOptions) -> Result<TargetIndex> {
     }
 }
 
-/// `cube.fits` to `cube.channel-5.fits`.
+/// `cube.fits` (or `cube.fits.gz`, `cube.fits.fz`) to `cube.channel-5.fits`.
 fn default_output_path(input: &Path, output_name: &str, index: usize) -> PathBuf {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    // Planes are written uncompressed, so name them as plain FITS
+    let input = match input.extension().and_then(|e| e.to_str()) {
+        Some("gz" | "fz") => Path::new(input.file_stem().unwrap_or_default()),
+        _ => input,
+    };
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     let ext = input.extension().unwrap_or_default().to_string_lossy();
     parent.join(format!("{stem}.{output_name}-{index}.{ext}"))
@@ -102,15 +109,17 @@ pub fn extract_plane_from_cube(cube: &Path, opts: &ExtractOptions) -> Result<Pat
     Ok(out_path)
 }
 
-/// Extract every channel of `cube` into its own image and return their paths.
+/// Extract every plane of `cube` into its own image and return their paths.
 ///
-/// The cube and its beam table are read once, rather than once per plane.
+/// Planes are taken along the FREQ or TIME axis, whichever has more than one
+/// plane. The cube and its beam table are read once, rather than once per plane.
 pub fn extract_planes_from_cube(cube: &Path, opts: &ExtractPlanesOptions) -> Result<Vec<PathBuf>> {
-    let (_, source) = Cube::open(cube, opts.hdu_index, "FREQ")?;
+    let (axis_name, output_name) = find_plane_axis(cube, opts.hdu_index)?;
+    let (_, source) = Cube::open(cube, opts.hdu_index, axis_name)?;
     let n = source.n_planes();
     let out_paths = match &opts.output_paths {
         None => (0..n)
-            .map(|i| default_output_path(cube, "channel", i))
+            .map(|i| default_output_path(cube, output_name, i))
             .collect(),
         Some(paths) if paths.len() == n => paths.clone(),
         Some(paths) => {
@@ -141,6 +150,32 @@ pub fn extract_planes_from_cube(cube: &Path, opts: &ExtractPlanesOptions) -> Res
         )
     })?;
     Ok(out_paths)
+}
+
+/// The axis to split a cube along: FREQ or TIME, whichever has more than one
+/// plane (a time cube made from images keeps their one-plane FREQ axis).
+fn find_plane_axis(cube: &Path, hdu_index: usize) -> Result<(&'static str, &'static str)> {
+    check_exists(cube)?;
+    let mut fptr = FitsFile::open(cube)?;
+    fptr.hdu(hdu_index)?;
+    let dims = HeaderGeom::from_file(&mut fptr)?.dims;
+    let mut found = Vec::new();
+    for (axis_name, output_name) in [("FREQ", "channel"), ("TIME", "timestep")] {
+        if let Some(axis) = find_axis(&mut fptr, axis_name)? {
+            found.push((axis_name, output_name, dims[axis.fits_idx - 1]));
+        }
+    }
+    let long: Vec<_> = found.iter().filter(|(_, _, n)| *n > 1).collect();
+    match (long.as_slice(), found.first()) {
+        ([(axis_name, output_name, _)], _) => Ok((axis_name, output_name)),
+        ([], Some((axis_name, output_name, _))) => Ok((axis_name, output_name)),
+        ([], None) => Err(FitsCubeError::TargetAxisMissing(
+            "Did not find a FREQ or TIME axis".to_string(),
+        )),
+        _ => Err(FitsCubeError::InvalidSpec(
+            "Both the FREQ and TIME axes have more than one plane, so cannot pick one".to_string(),
+        )),
+    }
 }
 
 /// The parts of a cube that every extracted plane needs.
@@ -253,26 +288,27 @@ fn copy_plane<T: Pixel>(
     disable_scaling(src)?;
     read_pixels(src, Some(&ranges), None, &mut plane)?;
 
-    let mut out = copy_hdu_header(src, path)?;
     let mut dims = cube.geom.dims.clone();
     dims[fi - 1] = 1;
-    resize_image(&mut out, cube.geom.bitpix, &dims)?;
-    update_key_i64(&mut out, &format!("CRPIX{fi}"), 1)?;
-    update_key_f64(&mut out, &format!("CRVAL{fi}"), world(&cube.axis, index))?;
+    let mut header = plain_header(src, cube.geom.bitpix, &dims)?;
+    update_key_i64(&mut header, &format!("CRPIX{fi}"), 1)?;
+    update_key_f64(&mut header, &format!("CRVAL{fi}"), world(&cube.axis, index))?;
     if let Some(b) = beam {
-        update_key_f64(&mut out, "BMAJ", b.major_deg)?;
-        update_key_f64(&mut out, "BMIN", b.minor_deg)?;
-        update_key_f64(&mut out, "BPA", b.pa_deg)?;
+        update_key_f64(&mut header, "BMAJ", b.major_deg)?;
+        update_key_f64(&mut header, "BMIN", b.minor_deg)?;
+        update_key_f64(&mut header, "BPA", b.pa_deg)?;
     }
     if cube.casambm {
-        delete_key(&mut out, "CASAMBM")?;
+        delete_key(&mut header, "CASAMBM")?;
     }
-    disable_scaling(&mut out)?;
-    write_pixels(&mut out, 0, &plane)?;
-    let mut status = 0;
-    // SAFETY: `out` is open; flushing reports write errors that close hides.
-    unsafe { sys::ffflus(out.as_raw(), &mut status) };
-    check_status(status)?;
+    let layout = extract_header_layout(&mut header, &dims)?;
+
+    swap_to_be(&mut plane);
+    let data = as_bytes(&plane);
+    let mut out = File::create(path)?;
+    out.write_all(&layout.header)?;
+    out.write_all(data)?;
+    out.write_all(&vec![0u8; (2880 - data.len() % 2880) % 2880])?;
     Ok(())
 }
 
@@ -288,6 +324,10 @@ mod tests {
     fn output_path_default() {
         let p = default_output_path(Path::new("/data/cube.fits"), "channel", 5);
         assert_eq!(p, PathBuf::from("/data/cube.channel-5.fits"));
+        for compressed in ["/data/cube.fits.gz", "/data/cube.fits.fz"] {
+            let p = default_output_path(Path::new(compressed), "channel", 5);
+            assert_eq!(p, PathBuf::from("/data/cube.channel-5.fits"));
+        }
     }
 
     #[test]

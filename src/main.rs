@@ -1,4 +1,5 @@
-//! The `fitscubers` CLI: `combine` images into a cube, or `extract` a plane.
+//! The `fitscubers` CLI: `combine` images into a cube, `extract` a plane, or
+//! `compress` and `decompress` a cube.
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -7,12 +8,16 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use fitscube_rs::combine::{CombineOptions, combine_fits};
+use fitscube_rs::compress::{
+    CompressMethod, CompressOptions, DecompressOptions, compress_cube, decompress_cube,
+};
 use fitscube_rs::extract::{ExtractOptions, extract_plane_from_cube};
 
 #[derive(Parser)]
 #[command(
     name = "fitscubers",
-    about = "Combine single-frequency/single-time FITS images into a cube, or extract a plane",
+    about = "Combine single-frequency/single-time FITS images into a cube, extract a plane, \
+             or compress a cube",
     version
 )]
 struct Cli {
@@ -26,6 +31,10 @@ enum Command {
     Combine(CombineArgs),
     /// Extract a plane (channel or timestep) from a FITS cube.
     Extract(ExtractArgs),
+    /// Compress a cube to .fits.gz or .fits.fz.
+    Compress(CompressArgs),
+    /// Turn a .fits.gz or .fits.fz cube back into plain FITS.
+    Decompress(DecompressArgs),
 }
 
 #[derive(Args)]
@@ -73,9 +82,63 @@ struct CombineArgs {
     /// plane (e.g. a wsclean model image planted by -fit-spectral-pol).
     #[arg(long)]
     no_blank_zero_beams: bool,
-    /// Gzip the cube to OUT_CUBE.gz once it is written.
+    /// Compress the output cube once written.
     #[arg(long)]
     compress: bool,
+    /// How --compress compresses. 'gzip' and 'pgzip' gzip the whole file to
+    /// .fits.gz, 'pgzip' across --max-workers threads. 'tile-gzip' (lossless)
+    /// and 'tile-rice' (lossy, see --quantize-level) tile-compress to .fits.fz,
+    /// as fpack does, so single planes can be read without decompressing the
+    /// whole cube.
+    #[arg(long, value_enum, default_value_t = CompressMethod::Gzip)]
+    compress_method: CompressMethod,
+    /// Quantization steps per noise sigma for 'tile-rice'. Higher keeps more
+    /// precision and compresses less.
+    #[arg(long, default_value_t = 4.0)]
+    quantize_level: f32,
+}
+
+#[derive(Args)]
+struct CompressArgs {
+    /// An uncompressed FITS cube.
+    cube: PathBuf,
+    /// 'gzip'/'pgzip' gzip the whole file to .fits.gz. 'tile-gzip' (lossless)
+    /// and 'tile-rice' (lossy) tile-compress to .fits.fz, as fpack does.
+    #[arg(long, value_enum, default_value_t = CompressMethod::TileGzip)]
+    method: CompressMethod,
+    /// Quantization steps per noise sigma for 'tile-rice'.
+    #[arg(long, default_value_t = 4.0)]
+    quantize_level: f32,
+    /// Compression threads (default: one per core).
+    #[arg(long)]
+    max_workers: Option<usize>,
+    /// Let 'tile-rice' quantize a cube that was already quantized once.
+    #[arg(long)]
+    allow_requantize: bool,
+    /// Delete the input once done.
+    #[arg(long)]
+    remove: bool,
+    /// Increase output verbosity (repeatable).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbosity: u8,
+}
+
+#[derive(Args)]
+struct DecompressArgs {
+    /// A .fits.gz or tile-compressed .fits.fz cube.
+    cube: PathBuf,
+    /// Output path. Defaults to the input without .gz/.fz.
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+    /// Replace the output if it exists.
+    #[arg(long)]
+    overwrite: bool,
+    /// Delete the compressed input once done.
+    #[arg(long)]
+    remove: bool,
+    /// Increase output verbosity (repeatable).
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbosity: u8,
 }
 
 #[derive(Args)]
@@ -160,7 +223,13 @@ fn run_combine(args: CombineArgs) -> Result<()> {
         .context("combining FITS files into a cube")?;
 
     let out_cube = if args.compress {
-        fitscube_rs::compress::compress_cube(&args.out_cube).context("compressing the cube")?
+        let options = CompressOptions {
+            method: args.compress_method,
+            max_workers: args.max_workers,
+            quantize_level: args.quantize_level,
+            ..CompressOptions::default()
+        };
+        compress_cube(&args.out_cube, &options).context("compressing the cube")?
     } else {
         args.out_cube.clone()
     };
@@ -191,10 +260,39 @@ fn run_extract(args: ExtractArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_compress(args: CompressArgs) -> Result<()> {
+    init_logging(args.verbosity);
+    let options = CompressOptions {
+        method: args.method,
+        max_workers: args.max_workers,
+        quantize_level: args.quantize_level,
+        allow_requantize: args.allow_requantize,
+        remove: args.remove,
+        ..CompressOptions::default()
+    };
+    let out = compress_cube(&args.cube, &options).context("compressing the cube")?;
+    info!("Written {}", out.display());
+    Ok(())
+}
+
+fn run_decompress(args: DecompressArgs) -> Result<()> {
+    init_logging(args.verbosity);
+    let options = DecompressOptions {
+        output: args.output,
+        overwrite: args.overwrite,
+        remove: args.remove,
+    };
+    let out = decompress_cube(&args.cube, &options).context("decompressing the cube")?;
+    info!("Written {}", out.display());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Combine(args) => run_combine(args),
         Command::Extract(args) => run_extract(args),
+        Command::Compress(args) => run_compress(args),
+        Command::Decompress(args) => run_decompress(args),
     }
 }

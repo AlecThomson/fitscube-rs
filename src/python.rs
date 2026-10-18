@@ -1,5 +1,5 @@
-//! Python bindings (`fitscube_rs._fitscube_rs`) over [`crate::combine`] and
-//! [`crate::extract`].
+//! Python bindings (`fitscube_rs._fitscube_rs`) over [`crate::combine`],
+//! [`crate::extract`] and [`crate::compress`].
 use std::path::PathBuf;
 
 use pyo3::exceptions::{
@@ -11,6 +11,10 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pyme
 
 use crate::bounding_box::{BoundingBox, get_common_bounding_box as rust_common_bounding_box};
 use crate::combine::{CombineOptions, combine_fits as rust_combine_fits};
+use crate::compress::{
+    CompressMethod, CompressOptions, DecompressOptions, compress_cube as rust_compress,
+    decompress_cube as rust_decompress,
+};
 use crate::error::FitsCubeError;
 use crate::extract::{
     ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube as rust_extract,
@@ -385,6 +389,106 @@ fn extract_planes_from_cube(
         .map_err(to_py_err)
 }
 
+/// Compress a finished cube.
+///
+/// Args:
+///     cube (str): Path of the uncompressed cube.
+///     method (str): 'gzip' and 'pgzip' gzip the whole file to ``.fits.gz``,
+///         'pgzip' across threads. 'tile-gzip' (lossless) and 'tile-rice'
+///         (lossy) tile-compress to ``.fits.fz``, as fpack does.
+///     max_workers (int, optional): Threads for 'pgzip' and the tile methods.
+///         Defaults to one per core.
+///     quantize_level (float): Quantization steps per noise sigma for 'tile-rice'.
+///     tile_shape (tuple[int, int], optional): (y, x) tile size for the tile
+///         methods. Defaults to bands of 64 full-width rows.
+///     allow_requantize (bool): Let 'tile-rice' quantize a cube that was
+///         already quantized once.
+///     remove (bool): Delete ``cube`` once the compressed cube is written.
+///
+/// Returns:
+///     Path: The compressed cube.
+///
+/// Raises:
+///     ValueError: For a compressed, integer or already quantized input, or
+///         an unknown method.
+///     OSError: On a read or write error.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (
+    cube,
+    method="gzip",
+    max_workers=None,
+    quantize_level=4.0,
+    tile_shape=None,
+    allow_requantize=false,
+    remove=true,
+))]
+#[allow(clippy::too_many_arguments)]
+fn compress_cube(
+    py: Python<'_>,
+    cube: PathBuf,
+    method: &str,
+    max_workers: Option<usize>,
+    quantize_level: f32,
+    tile_shape: Option<(usize, usize)>,
+    allow_requantize: bool,
+    remove: bool,
+) -> PyResult<PathBuf> {
+    let method = <CompressMethod as clap::ValueEnum>::from_str(method, false)
+        .map_err(|_| PyValueError::new_err(format!("unknown compression method {method:?}")))?;
+    let options = CompressOptions {
+        method,
+        max_workers,
+        quantize_level,
+        tile_shape,
+        allow_requantize,
+        remove,
+        ..CompressOptions::default()
+    };
+    py.detach(|| rust_compress(&cube, &options))
+        .map_err(to_py_err)
+}
+
+/// Write a gzipped or tile-compressed cube back out as plain FITS.
+///
+/// A cube that was quantized (lossy) is marked ``FCLOSSY = T``, with
+/// ``FCQLEVEL`` and a HISTORY card, so that later compression knows not to
+/// quantize it again.
+///
+/// Args:
+///     cube (str): A ``.fits.gz`` or tile-compressed (``.fits.fz``) cube.
+///     output (str, optional): Where to write. Defaults to ``cube`` without
+///         its ``.gz``/``.fz`` suffix.
+///     overwrite (bool): Replace ``output`` if it exists.
+///     remove (bool): Delete ``cube`` once the output is written.
+///
+/// Returns:
+///     Path: The uncompressed cube.
+///
+/// Raises:
+///     FileExistsError: If ``output`` exists and ``overwrite`` is not set.
+///     ValueError: If no output name can be derived, or a ``.fz`` file has no
+///         tile-compressed image.
+///     OSError: On a read or write error.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (cube, output=None, overwrite=false, remove=false))]
+fn decompress_cube(
+    py: Python<'_>,
+    cube: PathBuf,
+    output: Option<PathBuf>,
+    overwrite: bool,
+    remove: bool,
+) -> PyResult<PathBuf> {
+    let options = DecompressOptions {
+        output,
+        overwrite,
+        remove,
+    };
+    py.detach(|| rust_decompress(&cube, &options))
+        .map_err(to_py_err)
+}
+
 #[cfg(feature = "stubgen")]
 pyo3_stub_gen::define_stub_info_gatherer!(stub_info);
 
@@ -411,6 +515,8 @@ pub fn _fitscube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(get_common_bounding_box, m)?)?;
     m.add_function(wrap_pyfunction!(extract_plane_from_cube, m)?)?;
     m.add_function(wrap_pyfunction!(extract_planes_from_cube, m)?)?;
+    m.add_function(wrap_pyfunction!(compress_cube, m)?)?;
+    m.add_function(wrap_pyfunction!(decompress_cube, m)?)?;
     #[cfg(feature = "stubgen")]
     m.add_function(wrap_pyfunction!(_generate_stubs, m)?)?;
     Ok(())

@@ -20,10 +20,12 @@ pub mod combine;
 pub mod compress;
 pub mod error;
 pub mod extract;
+mod header;
 mod partial;
 mod pixels;
 pub mod progress;
 pub mod specs;
+mod tile;
 mod wcs;
 
 pub use beams::Beam;

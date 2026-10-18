@@ -473,9 +473,19 @@ impl CubeHeader<'_> {
             update_key_str(&mut fptr, &format!("CUNIT{fi}"), unit)?;
             update_key_str(&mut fptr, &format!("CTYPE{fi}"), ctype)?;
         }
-        if (first.has_cd || first.has_pc) && fi != 1 {
-            let kind = if first.has_cd { "CD" } else { "PC" };
-            update_key_f64(&mut fptr, &format!("{kind}{fi}_{fi}"), 1.0)?;
+        // A CD matrix replaces CDELT, so it has to carry the step itself
+        if first.has_cd && fi != 1 {
+            update_key_f64(&mut fptr, &format!("CD{fi}_{fi}"), cdelt)?;
+        } else if first.has_pc && fi != 1 {
+            update_key_f64(&mut fptr, &format!("PC{fi}_{fi}"), 1.0)?;
+        }
+        if self.time_domain_mode {
+            // The axis holds UTC MJD seconds, whatever reference the inputs used
+            for key in ["JDREF", "JDREFI", "JDREFF", "MJDREFI", "MJDREFF", "DATEREF"] {
+                delete_key(&mut fptr, key)?;
+            }
+            update_key_f64(&mut fptr, "MJDREF", 0.0)?;
+            update_key_str(&mut fptr, "TIMESYS", "UTC")?;
         }
 
         if self.varying_beams {
@@ -641,13 +651,13 @@ impl CubeWriter<'_> {
 }
 
 #[cfg(unix)]
-fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
 }
 
 #[cfg(windows)]
-fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+pub(crate) fn write_at(file: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match file.seek_write(buf, offset)? {
