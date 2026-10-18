@@ -26,7 +26,7 @@ use crate::checks::{
     read_input_headers,
 };
 use crate::error::{FitsCubeError, Result};
-use crate::partial::partial_file;
+use crate::partial::{partial_file, same_file};
 use crate::pixels::bbox_ranges;
 use crate::progress::{progress_bar, spinner};
 use crate::specs::parse_specs;
@@ -97,6 +97,9 @@ pub fn combine_fits(
     let float_bitpix = float_length_to_bitpix(options.float_length)?;
     for path in file_list {
         check_exists(path)?;
+        if same_file(path, out_cube) {
+            return Err(FitsCubeError::OutputIsInput(out_cube.to_path_buf()));
+        }
     }
     if out_cube.exists() && !options.overwrite {
         return Err(FitsCubeError::OutputExists(out_cube.to_path_buf()));

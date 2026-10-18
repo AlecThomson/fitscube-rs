@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -49,6 +50,8 @@ def _time(fn, repeat: int) -> float:
     """Best-of-`repeat` wall-clock time in seconds."""
     best = float("inf")
     for _ in range(repeat):
+        # So a run does not pay for the previous one's write-back
+        os.sync()
         start = time.perf_counter()
         fn()
         best = min(best, time.perf_counter() - start)

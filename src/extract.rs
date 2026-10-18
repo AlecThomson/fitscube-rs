@@ -18,7 +18,7 @@ use crate::beams::{Beam, read_beam_table};
 use crate::combine::{check_exists, in_pool};
 use crate::error::{FitsCubeError, Result};
 use crate::header::plain_header;
-use crate::partial::partial_file;
+use crate::partial::{partial_file, same_file};
 use crate::pixels::with_pixel_type;
 use crate::wcs::{find_axis, world};
 
@@ -310,10 +310,6 @@ fn copy_plane<T: Pixel>(
     out.write_all(data)?;
     out.write_all(&vec![0u8; (2880 - data.len() % 2880) % 2880])?;
     Ok(())
-}
-
-fn same_file(a: &Path, b: &Path) -> bool {
-    matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
 }
 
 #[cfg(test)]

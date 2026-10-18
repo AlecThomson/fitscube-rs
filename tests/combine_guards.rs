@@ -1084,7 +1084,8 @@ fn failed_combine_leaves_no_partial_cube() {
     f.set_len(2880 + 100).unwrap();
     drop(f);
     combine_fits(&files, &out_cube, &options()).unwrap_err();
-    assert_eq!(std::fs::read_to_string(&out_cube).unwrap(), "old");
+    // The old cube was removed before writing started, as fitscube does
+    assert!(!out_cube.exists());
     let names: Vec<_> = std::fs::read_dir(dir.path())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -1226,4 +1227,13 @@ fn extract_planes_splits_time_cubes() {
         assert!(read_planes(plane).iter().all(|p| all_eq(p, i as f64)));
         assert_eq!(read_i64(plane, "NAXIS5"), 1);
     }
+}
+
+#[test]
+fn output_cannot_be_an_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = make_planes(dir.path(), "img", &specs(), |_| Plane::default());
+    let err = combine_fits(&files, &files[0], &options()).unwrap_err();
+    assert!(matches!(err, FitsCubeError::OutputIsInput(_)), "{err:?}");
+    assert!(files[0].exists());
 }
