@@ -95,7 +95,7 @@ autoapi_root = "autoapi"
 autoapi_add_toctree_entry = True
 
 
-def _skip_compat_reexports(app, what, name, obj, skip, options):
+def _skip_compat_reexports(_app, _what, name, obj, skip, _options):
     """Document compat's re-exports once, under fitscube_rs."""
     if name.startswith("fitscube_rs.compat.") and obj.imported:
         return True
