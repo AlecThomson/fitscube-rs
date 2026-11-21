@@ -100,7 +100,9 @@ def _header(**cards) -> fits.Header:
 )
 def test_find_target_axis(cards):
     h = _header(**cards)
-    assert compat.find_target_axis(h).__dict__ == fc_extract.find_target_axis(h).__dict__
+    assert (
+        compat.find_target_axis(h).__dict__ == fc_extract.find_target_axis(h).__dict__
+    )
     assert compat.count_cube_planes(h) == fc_extract.count_cube_planes(h) == 7
 
 
@@ -125,10 +127,7 @@ def _fields(box) -> tuple:
 def test_extract_common_bounding_box():
     shape = (50, 60)
     ref = fc_bbox.extract_common_bounding_box(
-        [
-            b and fc_bbox.BoundingBox(*b, shape, b[3] - b[2], b[1] - b[0])
-            for b in BOXES
-        ]
+        [b and fc_bbox.BoundingBox(*b, shape, b[3] - b[2], b[1] - b[0]) for b in BOXES]
     )
     rs = compat.extract_common_bounding_box(
         [b and compat.BoundingBox(*b, shape) for b in BOXES]
