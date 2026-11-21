@@ -1,17 +1,15 @@
 //! Compress a finished cube with gzip or FITS tile compression (as fpack
 //! does), and turn a compressed cube back into plain FITS.
-use std::ffi::c_int;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use atfits_rs::{
-    Pixel, as_bytes, disable_scaling, extract_header_layout, image_shape, key_f64, key_i64,
-    key_string, read_pixels, swap_to_be, update_key_f64, update_key_logical,
+    Pixel, as_bytes, disable_scaling, extract_header_layout, image_bitpix, image_shape, key_f64,
+    key_i64, key_string, read_pixels, swap_to_be, update_key_f64, update_key_logical,
+    write_history,
 };
 use fitsio::FitsFile;
-use fitsio::errors::check_status;
-use fitsio::sys;
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
@@ -268,11 +266,7 @@ fn untile_cube(cube: &Path, output: &Path) -> Result<()> {
         .ok_or_else(|| FitsCubeError::NotTileCompressed(cube.to_path_buf()))?;
     fptr.hdu(index)?;
 
-    let mut bitpix: c_int = 0;
-    let mut status = 0;
-    unsafe { sys::ffgidt(fptr.as_raw(), &mut bitpix, &mut status) };
-    check_status(status)?;
-    let bitpix = i64::from(bitpix);
+    let bitpix = image_bitpix(&mut fptr)?;
     let dims = image_shape(&mut fptr)?;
 
     let mut header = plain_header(&mut fptr, bitpix, &dims)?;
@@ -295,12 +289,12 @@ fn untile_cube(cube: &Path, output: &Path) -> Result<()> {
             update_key_f64(&mut header, "FCQLEVEL", level)?;
         }
         let level = noisebit.map_or_else(|| "None".to_string(), |l| format!("{l:?}"));
-        let history = std::ffi::CString::new(format!(
-            "fitscube: decompressed from lossy {codec}, quantize level {level}. Values are not the originals."
-        ))
-        .map_err(|e| FitsCubeError::Atfits(e.to_string()))?;
-        unsafe { sys::ffphis(header.as_raw(), history.as_ptr(), &mut status) };
-        check_status(status)?;
+        write_history(
+            &mut header,
+            &format!(
+                "fitscube: decompressed from lossy {codec}, quantize level {level}. Values are not the originals."
+            ),
+        )?;
     }
     let layout = extract_header_layout(&mut header, &dims)?;
 

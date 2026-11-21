@@ -57,7 +57,13 @@ fn to_py_err(e: FitsCubeError) -> PyErr {
 /// (``NAXIS1``). Minimum values are inclusive and maximum values exclusive, so
 /// a plane is sliced as ``data[..., xmin:xmax, ymin:ymax]``.
 #[cfg_attr(feature = "stubgen", gen_stub_pyclass)]
-#[pyclass(name = "BoundingBox", module = "fitscube_rs._fitscube_rs", frozen, eq)]
+#[pyclass(
+    name = "BoundingBox",
+    module = "fitscube_rs._fitscube_rs",
+    frozen,
+    eq,
+    from_py_object
+)]
 #[derive(Clone, PartialEq)]
 struct PyBoundingBox(BoundingBox);
 
