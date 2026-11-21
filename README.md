@@ -1,6 +1,6 @@
 # fitscube-rs
 
-[![Docs](https://readthedocs.org/projects/fitscube-rs/badge/?version=latest)](https://fitscube-rs.readthedocs.io/en/latest/)
+[![Docs](https://img.shields.io/readthedocs/fitscube-rs)](https://fitscube-rs.readthedocs.io/en/latest/)
 [![docs.rs](https://img.shields.io/docsrs/fitscube-rs)](https://docs.rs/fitscube-rs)
 [![PyPI](https://img.shields.io/pypi/v/fitscube-rs)](https://pypi.org/project/fitscube-rs/)
 [![crates.io](https://img.shields.io/crates/v/fitscube-rs)](https://crates.io/crates/fitscube-rs)
