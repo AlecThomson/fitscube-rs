@@ -94,6 +94,18 @@ autoapi_keep_files = False
 autoapi_root = "autoapi"
 autoapi_add_toctree_entry = True
 
+
+def _skip_compat_reexports(_app, _what, name, obj, skip, _options):
+    """Document compat's re-exports once, under fitscube_rs."""
+    if name.startswith("fitscube_rs.compat.") and obj.imported:
+        return True
+    return skip
+
+
+def setup(app):
+    app.connect("autoapi-skip-member", _skip_compat_reexports)
+
+
 # Napoleon settings (docstrings are Google style, generated from the Rust
 # `///` comments for the native module)
 napoleon_google_docstring = True

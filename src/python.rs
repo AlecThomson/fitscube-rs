@@ -6,11 +6,15 @@ use pyo3::exceptions::{
     PyFileExistsError, PyNotImplementedError, PyOSError, PyRuntimeError, PyValueError,
 };
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 #[cfg(feature = "stubgen")]
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyfunction, gen_stub_pymethods};
 
-use crate::bounding_box::{BoundingBox, get_common_bounding_box as rust_common_bounding_box};
-use crate::combine::{CombineOptions, combine_fits as rust_combine_fits};
+use crate::bounding_box::{
+    BoundingBox, extract_common_bounding_box as rust_extract_common_bounding_box,
+    get_common_bounding_box as rust_common_bounding_box,
+};
+use crate::combine::{CombineOptions, combine_fits as rust_combine_fits, in_pool};
 use crate::compress::{
     CompressMethod, CompressOptions, DecompressOptions, compress_cube as rust_compress,
     decompress_cube as rust_decompress,
@@ -20,6 +24,7 @@ use crate::extract::{
     ExtractOptions, ExtractPlanesOptions, extract_plane_from_cube as rust_extract,
     extract_planes_from_cube as rust_extract_planes,
 };
+use crate::specs::even_spacing as rust_even_spacing;
 
 // Defined in fitscube_rs/__init__.py, with the names of fitscube.exceptions
 pyo3::import_exception!(fitscube_rs, TargetAxisMissingException);
@@ -66,6 +71,9 @@ fn to_py_err(e: FitsCubeError) -> PyErr {
 )]
 #[derive(Clone, PartialEq)]
 struct PyBoundingBox(BoundingBox);
+
+/// The arguments of ``BoundingBox(...)``.
+type BoxArgs = (usize, usize, usize, usize, (usize, usize));
 
 #[cfg_attr(feature = "stubgen", gen_stub_pymethods)]
 #[pymethods]
@@ -136,6 +144,15 @@ impl PyBoundingBox {
         self.0.x_span
     }
 
+    /// Rebuild from the constructor arguments, so boxes can be pickled.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> (Bound<'py, PyType>, BoxArgs) {
+        let b = &slf.get().0;
+        (
+            slf.get_type(),
+            (b.xmin, b.xmax, b.ymin, b.ymax, b.original_shape),
+        )
+    }
+
     fn __repr__(&self) -> String {
         let b = &self.0;
         format!(
@@ -169,6 +186,8 @@ impl pyo3_stub_gen::PyStubType for BoundingBoxArg {
 /// Args:
 ///     file_list (list[str]): The FITS images to consider.
 ///     invalidate_zeros (bool): Treat exactly-zero pixels as invalid.
+///     max_workers (int, optional): Number of threads reading images.
+///         Defaults to one per core.
 ///
 /// Returns:
 ///     BoundingBox: The smallest bounding box that contains all valid data.
@@ -179,15 +198,73 @@ impl pyo3_stub_gen::PyStubType for BoundingBoxArg {
 ///     ValueError: If no image has valid data.
 #[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
 #[pyfunction]
-#[pyo3(signature = (file_list, invalidate_zeros=false))]
+#[pyo3(signature = (file_list, invalidate_zeros=false, max_workers=None))]
 fn get_common_bounding_box(
     py: Python<'_>,
     file_list: Vec<PathBuf>,
     invalidate_zeros: bool,
+    max_workers: Option<usize>,
 ) -> PyResult<PyBoundingBox> {
-    py.detach(|| rust_common_bounding_box(&file_list, invalidate_zeros))
+    let pool = max_workers
+        .map(|n| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n.max(1))
+                .build()
+        })
+        .transpose()
+        .map_err(|e| to_py_err(e.into()))?;
+    py.detach(|| {
+        in_pool(pool.as_ref(), || {
+            rust_common_bounding_box(&file_list, invalidate_zeros)
+        })
+    })
+    .map(PyBoundingBox)
+    .map_err(to_py_err)
+}
+
+/// The smallest box holding every box in ``bounding_boxes``, skipping ``None``.
+///
+/// Args:
+///     bounding_boxes (list[BoundingBox | None]): Boxes of planes of one shape.
+///
+/// Returns:
+///     BoundingBox: The common box.
+///
+/// Raises:
+///     ShapeMismatchException: If the boxes come from planes of different shapes.
+///     ValueError: If every entry is ``None``.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+fn extract_common_bounding_box(
+    bounding_boxes: Vec<Option<PyBoundingBox>>,
+) -> PyResult<PyBoundingBox> {
+    let boxes: Vec<Option<BoundingBox>> =
+        bounding_boxes.into_iter().map(|b| b.map(|b| b.0)).collect();
+    rust_extract_common_bounding_box(&boxes)
         .map(PyBoundingBox)
         .map_err(to_py_err)
+}
+
+/// Put frequencies (Hz) or times (s) on a regular grid, as ``combine_fits``
+/// does with ``create_blanks``.
+///
+/// Args:
+///     specs (list[float]): The input frequencies or times, in any order.
+///     time_domain_mode (bool): Treat ``specs`` as times.
+///
+/// Returns:
+///     tuple[list[float], list[bool]]: The sorted grid values, and whether each
+///     grid point has no input.
+///
+/// Raises:
+///     IrregularSpacingException: If no grid of at most 1000 points per input
+///         holds every input.
+///     ValueError: If a value is not finite.
+#[cfg_attr(feature = "stubgen", gen_stub_pyfunction)]
+#[pyfunction]
+#[pyo3(signature = (specs, time_domain_mode=false))]
+fn even_spacing(specs: Vec<f64>, time_domain_mode: bool) -> PyResult<(Vec<f64>, Vec<bool>)> {
+    rust_even_spacing(&specs, time_domain_mode).map_err(to_py_err)
 }
 
 /// Combine single-plane FITS images into a cube.
@@ -519,6 +596,8 @@ pub fn _fitscube_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBoundingBox>()?;
     m.add_function(wrap_pyfunction!(combine_fits, m)?)?;
     m.add_function(wrap_pyfunction!(get_common_bounding_box, m)?)?;
+    m.add_function(wrap_pyfunction!(extract_common_bounding_box, m)?)?;
+    m.add_function(wrap_pyfunction!(even_spacing, m)?)?;
     m.add_function(wrap_pyfunction!(extract_plane_from_cube, m)?)?;
     m.add_function(wrap_pyfunction!(extract_planes_from_cube, m)?)?;
     m.add_function(wrap_pyfunction!(compress_cube, m)?)?;

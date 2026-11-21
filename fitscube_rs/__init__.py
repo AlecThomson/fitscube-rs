@@ -4,6 +4,9 @@ A Rust port of the `fitscube <https://github.com/AlecThomson/fitscube>`_ Python
 package. The work is done in the compiled extension
 ``fitscube_rs._fitscube_rs``; this module re-exports its public API and
 defines the exceptions it raises.
+
+``fitscube_rs.compat`` has the API of the Python package itself, for code
+written against it (needs the ``compat`` extra).
 """
 
 from __future__ import annotations
@@ -13,6 +16,8 @@ from fitscube_rs._fitscube_rs import (
     combine_fits,
     compress_cube,
     decompress_cube,
+    even_spacing,
+    extract_common_bounding_box,
     extract_plane_from_cube,
     extract_planes_from_cube,
     get_common_bounding_box,
@@ -31,6 +36,8 @@ __all__ = [
     "combine_fits",
     "compress_cube",
     "decompress_cube",
+    "even_spacing",
+    "extract_common_bounding_box",
     "extract_plane_from_cube",
     "extract_planes_from_cube",
     "get_common_bounding_box",
