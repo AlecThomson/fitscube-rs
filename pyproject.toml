@@ -19,6 +19,9 @@ Documentation = "https://fitscube-rs.readthedocs.io"
 Repository = "https://github.com/AlecThomson/fitscube-rs"
 
 [project.optional-dependencies]
+# `fitscube_rs.compat`, the API of the Python fitscube package, returns astropy
+# Quantities.
+compat = ["astropy"]
 # Parity tests run both implementations on the same inputs and compare; the
 # reference `fitscube` must be >=2.10.0 (the release whose compression
 # fitscube-rs matches), and >=2.12.1 for its gridding, lean GZIP_2 and float64

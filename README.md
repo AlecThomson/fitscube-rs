@@ -27,6 +27,15 @@ headers. Per-channel beams go into a CASA `BEAMS` table.
 pip install fitscube-rs
 ```
 
+`fitscube_rs.compat` has the same API as the Python
+[fitscube](https://github.com/AlecThomson/fitscube) package, so code written
+against fitscube switches by changing its imports. It returns astropy
+Quantities, so it needs the `compat` extra:
+
+```sh
+pip install 'fitscube-rs[compat]'
+```
+
 ### CLI binary
 
 Requires [Rust](https://rustup.rs/) 1.88+.

@@ -10,6 +10,8 @@ __all__ = [
     "combine_fits",
     "compress_cube",
     "decompress_cube",
+    "even_spacing",
+    "extract_common_bounding_box",
     "extract_plane_from_cube",
     "extract_planes_from_cube",
     "get_common_bounding_box",
@@ -65,6 +67,10 @@ class BoundingBox:
         r"""
         A box over rows ``xmin:xmax`` and columns ``ymin:ymax`` of a plane of
         shape ``original_shape`` (rows, columns).
+        """
+    def __reduce__(self) -> tuple[type, tuple[builtins.int, builtins.int, builtins.int, builtins.int, tuple[builtins.int, builtins.int]]]:
+        r"""
+        Rebuild from the constructor arguments, so boxes can be pickled.
         """
     def __repr__(self) -> builtins.str: ...
 
@@ -163,6 +169,40 @@ def decompress_cube(cube: builtins.str | os.PathLike | pathlib.Path, output: typ
         OSError: On a read or write error.
     """
 
+def even_spacing(specs: typing.Sequence[builtins.float], time_domain_mode: builtins.bool = False) -> tuple[builtins.list[builtins.float], builtins.list[builtins.bool]]:
+    r"""
+    Put frequencies (Hz) or times (s) on a regular grid, as ``combine_fits``
+    does with ``create_blanks``.
+    
+    Args:
+        specs (list[float]): The input frequencies or times, in any order.
+        time_domain_mode (bool): Treat ``specs`` as times.
+    
+    Returns:
+        tuple[list[float], list[bool]]: The sorted grid values, and whether each
+        grid point has no input.
+    
+    Raises:
+        IrregularSpacingException: If no grid of at most 1000 points per input
+            holds every input.
+        ValueError: If a value is not finite.
+    """
+
+def extract_common_bounding_box(bounding_boxes: typing.Sequence[typing.Optional[BoundingBox]]) -> BoundingBox:
+    r"""
+    The smallest box holding every box in ``bounding_boxes``, skipping ``None``.
+    
+    Args:
+        bounding_boxes (list[BoundingBox | None]): Boxes of planes of one shape.
+    
+    Returns:
+        BoundingBox: The common box.
+    
+    Raises:
+        ShapeMismatchException: If the boxes come from planes of different shapes.
+        ValueError: If every entry is ``None``.
+    """
+
 def extract_plane_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Path, channel_index: typing.Optional[builtins.int] = None, time_index: typing.Optional[builtins.int] = None, hdu_index: builtins.int = 0, overwrite: builtins.bool = False, output_path: typing.Optional[builtins.str | os.PathLike | pathlib.Path] = None) -> builtins.str:
     r"""
     Extract a single plane (channel or timestep) from a FITS cube.
@@ -216,7 +256,7 @@ def extract_planes_from_cube(fits_cube: builtins.str | os.PathLike | pathlib.Pat
         OSError: On a FITS read or write error.
     """
 
-def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], invalidate_zeros: builtins.bool = False) -> BoundingBox:
+def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLike | pathlib.Path], invalidate_zeros: builtins.bool = False, max_workers: typing.Optional[builtins.int] = None) -> BoundingBox:
     r"""
     The smallest box holding the finite pixels of every image in ``file_list``.
     
@@ -227,6 +267,8 @@ def get_common_bounding_box(file_list: typing.Sequence[builtins.str | os.PathLik
     Args:
         file_list (list[str]): The FITS images to consider.
         invalidate_zeros (bool): Treat exactly-zero pixels as invalid.
+        max_workers (int, optional): Number of threads reading images.
+            Defaults to one per core.
     
     Returns:
         BoundingBox: The smallest bounding box that contains all valid data.
