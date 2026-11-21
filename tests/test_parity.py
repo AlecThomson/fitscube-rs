@@ -691,7 +691,16 @@ def test_decompress_matches_fitscube(tmp_path, method):
             ),
         )
     for by_ref, by_rs in out.values():
-        np.testing.assert_array_equal(fits.getdata(by_rs), fits.getdata(by_ref))
+        got, want = fits.getdata(by_rs), fits.getdata(by_ref)
+        if method == "tile-rice":
+            # Both run CFITSIO's dequantiser, but the C compiler may fuse its
+            # multiply-add (it does on current CI runners, not on every
+            # machine), which moves a value by an ulp or two
+            np.testing.assert_array_equal(np.isnan(got), np.isnan(want))
+            finite = np.isfinite(want)
+            np.testing.assert_array_max_ulp(got[finite], want[finite], maxulp=2)
+        else:
+            np.testing.assert_array_equal(got, want)
         ref_h, rs_h = fits.getheader(by_ref), fits.getheader(by_rs)
         for key in ("BUNIT", "CTYPE3", "NAXIS4", "FCLOSSY", "FCQLEVEL"):
             assert rs_h.get(key) == ref_h.get(key), key
