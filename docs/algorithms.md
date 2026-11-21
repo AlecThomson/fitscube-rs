@@ -138,7 +138,10 @@ more than one plane.
     stored exactly instead.
 
 The tiles are compressed across threads but written in order, so the output
-does not depend on the thread count. The dither seed (`ZDITHER0`) comes from
+does not depend on the thread count. Threads share out tiles, not planes, so a
+2D image or a cube of a few planes still uses every thread. Planes are read
+ahead in batches of up to about 1 GB, and never less than one plane, so a cube
+of very large planes holds only one or two at a time. The dither seed (`ZDITHER0`) comes from
 the middle plane, as in fitscube, so the same cube gives the same file, and a
 cube that changed (for instance by being quantised once already) is dithered
 afresh.

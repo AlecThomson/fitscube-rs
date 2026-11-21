@@ -21,13 +21,14 @@ Repository = "https://github.com/AlecThomson/fitscube-rs"
 [project.optional-dependencies]
 # Parity tests run both implementations on the same inputs and compare; the
 # reference `fitscube` must be >=2.10.0 (the release whose compression
-# fitscube-rs matches), and >=2.11.0 for its gridding, which needs Python 3.11.
+# fitscube-rs matches), and >=2.12.1 for its gridding, lean GZIP_2 and float64
+# extracted beams, which need Python 3.11.
 test = [
   "pytest",
   "numpy",
   "astropy",
   "radio-beam",
-  "fitscube>=2.11.0; python_version >= '3.11'",
+  "fitscube>=2.12.1; python_version >= '3.11'",
   "fitscube>=2.10.0; python_version < '3.11'",
 ]
 dev = ["prek", "ty"]

@@ -9,10 +9,10 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::mpsc::sync_channel;
 
-use atfits_rs::{image_shape, key_bool};
+use atfits_rs::{hdu_count, hdu_offsets, image_bitpix, image_shape, is_compressed_image, key_bool};
 use fitsio::FitsFile;
 use fitsio::errors::check_status;
-use fitsio::sys::{self, LONGLONG};
+use fitsio::sys;
 use flate2::{Compression, GzBuilder};
 use rayon::prelude::*;
 
@@ -244,12 +244,8 @@ impl Layout {
 pub(crate) fn image_kind(cube: &Path) -> Result<(i64, bool)> {
     let mut fptr = FitsFile::open(cube)?;
     fptr.primary_hdu()?;
-    let mut bitpix: c_int = 0;
-    let mut status = 0;
-    unsafe { sys::ffgidt(fptr.as_raw(), &mut bitpix, &mut status) };
-    check_status(status)?;
     Ok((
-        i64::from(bitpix),
+        image_bitpix(&mut fptr)?,
         key_bool(&mut fptr, "FCLOSSY")?.unwrap_or(false),
     ))
 }
@@ -261,16 +257,11 @@ pub(crate) fn has_compressed_hdu(cube: &Path) -> Result<bool> {
 
 /// The index of the first tile-compressed HDU.
 pub(crate) fn compressed_hdu(fptr: &mut FitsFile) -> Result<Option<usize>> {
-    let mut n: c_int = 0;
-    let mut status = 0;
-    unsafe { sys::ffthdu(fptr.as_raw(), &mut n, &mut status) };
-    check_status(status)?;
-    for i in 0..n as usize {
+    for i in 0..hdu_count(fptr)? {
         fptr.hdu(i)?;
-        if unsafe { sys::fits_is_compressed_image(fptr.as_raw(), &mut status) } != 0 {
+        if is_compressed_image(fptr)? {
             return Ok(Some(i));
         }
-        check_status(status)?;
     }
     Ok(None)
 }
@@ -333,18 +324,25 @@ pub(crate) fn tile_compress(
     out.write_all(&table.header(0, max_lengths))?;
     out.write_all(&descriptors)?;
 
-    let batch = 2 * threads.max(1);
+    // Tiles, not planes, are the unit of work, so a 2D image or a cube of a few
+    // planes still uses every thread. A batch holds enough tiles to keep the
+    // threads busy, within a memory budget: at least one plane is read at a
+    // time, and only as many as fit the budget beyond that.
+    let threads = threads.max(1);
+    let per_plane = layout.tiles_per_plane();
+    let want = (4 * threads).div_ceil(per_plane).clamp(1, 2 * threads);
+    let batch = want.min((READ_BUDGET / source.plane_bytes().max(1)).max(1));
     let mut heap_size = 0usize;
     std::thread::scope(|scope| -> Result<()> {
-        let (tx, rx) = sync_channel::<Vec<Vec<Tile>>>(1);
+        let (tx, rx) = sync_channel::<Vec<Tile>>(1);
         let width = table.row_width();
         let rice = table.is_rice();
         let (out, descriptors) = (&mut out, &mut descriptors);
         let (heap_size, max_lengths) = (&mut heap_size, &mut max_lengths);
         let writer = scope.spawn(move || -> Result<()> {
             let mut row = 0;
-            for planes in rx {
-                for tile in planes.into_iter().flatten() {
+            for tiles in rx {
+                for tile in tiles {
                     let cells = &mut descriptors[row * width..(row + 1) * width];
                     let columns = if rice { 2 } else { 1 };
                     for (col, data) in [&tile.data, &tile.gzip_data]
@@ -374,16 +372,33 @@ pub(crate) fn tile_compress(
         // Compressed here rather than in the spawned thread, which would leave
         // the caller's thread pool
         let produced = (|| -> Result<()> {
+            let tiles: Vec<_> = layout.tiles().collect();
+            let mut planes: Vec<Vec<u8>> = Vec::new();
             for start in (0..n_planes).step_by(batch) {
-                let planes = (start..(start + batch).min(n_planes))
+                let indices: Vec<usize> = (start..(start + batch).min(n_planes)).collect();
+                planes.resize_with(indices.len(), Vec::new);
+                planes
+                    .par_iter_mut()
+                    .zip(&indices)
+                    .try_for_each(|(buf, &plane)| source.read_plane(plane, buf))?;
+                let compressed = (0..indices.len() * per_plane)
                     .into_par_iter()
-                    .map_init(Vec::new, |buf, plane| {
-                        source.read_plane(plane, buf)?;
-                        compress_plane(buf, &layout, settings.codec, plane, seed, source.bitpix)
+                    .map(|k| {
+                        let (p, t) = (k / per_plane, k % per_plane);
+                        let row = indices[p] * per_plane + t;
+                        compress_tile(
+                            &planes[p],
+                            layout.nx,
+                            tiles[t],
+                            settings.codec,
+                            row,
+                            seed,
+                            source.bitpix,
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
                 // A failed writer drops the channel; its error is the one returned
-                if tx.send(planes).is_err() {
+                if tx.send(compressed).is_err() {
                     return Err(FitsCubeError::Cancelled);
                 }
             }
@@ -416,14 +431,9 @@ fn open_source(cube: &Path) -> Result<Source> {
     fptr.primary_hdu()?;
     let dims = image_shape(&mut fptr)?;
     let (bitpix, _) = image_kind(cube)?;
-    let (mut head, mut data, mut end): (LONGLONG, LONGLONG, LONGLONG) = (0, 0, 0);
-    let mut status = 0;
-    unsafe { sys::ffghadll(fptr.as_raw(), &mut head, &mut data, &mut end, &mut status) };
-    check_status(status)?;
-
     Ok(Source {
         file: File::open(cube)?,
-        data_start: data as u64,
+        data_start: hdu_offsets(&mut fptr)?.data_start,
         dims,
         bitpix,
         cards: user_cards(&mut fptr, false)?,
@@ -551,53 +561,59 @@ impl TableHeader<'_> {
     }
 }
 
-/// The tiles of one plane, given as big-endian bytes.
-fn compress_plane(
+/// Plane bytes read per batch beyond the first plane. A batch is always at
+/// least one plane, so a huge plane is never split.
+const READ_BUDGET: usize = 1 << 30;
+
+/// Compress tile `(y0, y1, x0, x1)` of a big-endian plane `nx` pixels wide,
+/// table row `row`.
+fn compress_tile(
     plane: &[u8],
-    layout: &Layout,
+    nx: usize,
+    (y0, y1, x0, x1): (usize, usize, usize, usize),
     codec: TileCodec,
-    index: usize,
+    row: usize,
     seed: u32,
     bitpix: i64,
-) -> Result<Vec<Tile>> {
+) -> Result<Tile> {
     let bytepix = bitpix.unsigned_abs() as usize / 8;
-    let first_row = index * layout.tiles_per_plane();
-    layout
-        .tiles()
-        .enumerate()
-        .map(|(i, (y0, y1, x0, x1))| {
-            let mut raw = Vec::with_capacity((y1 - y0) * (x1 - x0) * bytepix);
-            for y in y0..y1 {
-                let start = (y * layout.nx + x0) * bytepix;
-                raw.extend_from_slice(&plane[start..start + (x1 - x0) * bytepix]);
+    let width = (x1 - x0) * bytepix;
+    let rows = (y0..y1).map(|y| {
+        let start = (y * nx + x0) * bytepix;
+        &plane[start..start + width]
+    });
+    match codec {
+        TileCodec::Gzip2 { level } => Ok(Tile {
+            data: gzip(&shuffle(rows, (y1 - y0) * width, bytepix), level)?,
+            ..Tile::default()
+        }),
+        TileCodec::Rice1 { level } => {
+            let mut raw = Vec::with_capacity((y1 - y0) * width);
+            rows.for_each(|r| raw.extend_from_slice(r));
+            // CFITSIO's own convention for the dither of table row `row`
+            let row = row as c_long + c_long::from(seed);
+            let (nx, ny) = ((x1 - x0) as c_long, (y1 - y0) as c_long);
+            if bitpix == -32 {
+                rice_tile::<f32>(&raw, row, nx, ny, level)
+            } else {
+                rice_tile::<f64>(&raw, row, nx, ny, level)
             }
-            match codec {
-                TileCodec::Gzip2 { level } => Ok(Tile {
-                    data: gzip(&shuffle(&raw, bytepix), level)?,
-                    ..Tile::default()
-                }),
-                TileCodec::Rice1 { level } => {
-                    // CFITSIO's own convention for the dither of table row `row`
-                    let row = (first_row + i) as c_long + c_long::from(seed);
-                    let (nx, ny) = ((x1 - x0) as c_long, (y1 - y0) as c_long);
-                    if bitpix == -32 {
-                        rice_tile::<f32>(&raw, row, nx, ny, level)
-                    } else {
-                        rice_tile::<f64>(&raw, row, nx, ny, level)
-                    }
-                }
-            }
-        })
-        .collect()
+        }
+    }
 }
 
-/// GZIP_2 keeps the first byte of every value together, then the second, and so on.
-fn shuffle(raw: &[u8], bytepix: usize) -> Vec<u8> {
-    let n = raw.len() / bytepix;
-    let mut out = vec![0; raw.len()];
-    for (i, value) in raw.chunks_exact(bytepix).enumerate() {
-        for (b, &byte) in value.iter().enumerate() {
-            out[b * n + i] = byte;
+/// GZIP_2 keeps the first byte of every value together, then the second, and
+/// so on. Shuffles straight from the plane's rows of a tile, `len` bytes in all.
+fn shuffle<'a>(rows: impl Iterator<Item = &'a [u8]>, len: usize, bytepix: usize) -> Vec<u8> {
+    let n = len / bytepix;
+    let mut out = vec![0; len];
+    let mut i = 0;
+    for row in rows {
+        for value in row.chunks_exact(bytepix) {
+            for (b, &byte) in value.iter().enumerate() {
+                out[b * n + i] = byte;
+            }
+            i += 1;
         }
     }
     out
@@ -670,15 +686,13 @@ fn rice_tile<T: TileFloat>(
 /// Append every HDU of `src` except `skip` to `dst`.
 pub(crate) fn copy_other_hdus(src: &Path, dst: &Path, skip: &[usize]) -> Result<()> {
     let mut input = FitsFile::open(src)?;
-    let mut n: c_int = 0;
-    let mut status = 0;
-    unsafe { sys::ffthdu(input.as_raw(), &mut n, &mut status) };
-    check_status(status)?;
-    if (0..n as usize).all(|i| skip.contains(&i)) {
+    let n = hdu_count(&mut input)?;
+    if (0..n).all(|i| skip.contains(&i)) {
         return Ok(());
     }
     let mut output = FitsFile::edit(dst)?;
-    for i in (0..n as usize).filter(|i| !skip.contains(i)) {
+    let mut status = 0;
+    for i in (0..n).filter(|i| !skip.contains(i)) {
         input.hdu(i)?;
         unsafe { sys::ffcopy(input.as_raw(), output.as_raw(), 0, &mut status) };
         check_status(status)?;
@@ -713,7 +727,8 @@ mod tests {
 
     #[test]
     fn shuffle_groups_bytes() {
-        assert_eq!(shuffle(&[1, 2, 3, 4, 5, 6], 2), vec![1, 3, 5, 2, 4, 6]);
+        let rows: [&[u8]; 2] = [&[1, 2, 3, 4], &[5, 6]];
+        assert_eq!(shuffle(rows.into_iter(), 6, 2), vec![1, 3, 5, 2, 4, 6]);
     }
 
     #[test]

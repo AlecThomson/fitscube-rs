@@ -11,10 +11,9 @@ use std::sync::mpsc::sync_channel;
 use atfits_rs::raw::{Pixel, as_bytes, disable_scaling, read_pixels, swap_to_be};
 use atfits_rs::{
     CubeLayout, create_mem_cube, delete_key, extract_header_layout, key_f64, update_key_f64,
-    update_key_i64, update_key_logical, update_key_str, write_comment,
+    update_key_i64, update_key_logical, update_key_str, write_comment, write_history,
 };
-use fitsio::errors::check_status;
-use fitsio::{FitsFile, sys};
+use fitsio::FitsFile;
 use num_traits::Float;
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
@@ -393,15 +392,6 @@ fn is_evenly_spaced(specs: &[f64], time_domain_mode: bool) -> bool {
     }
     let mean_diff = diff.iter().sum::<f64>() / diff.len() as f64;
     diff.len() < 2 || max_dev < mean_diff * 0.02
-}
-
-fn write_history(fptr: &mut FitsFile, text: &str) -> Result<()> {
-    let text = std::ffi::CString::new(text).expect("history has no NUL bytes");
-    let mut status = 0;
-    // SAFETY: `fptr` is open and `text` outlives the call.
-    unsafe { sys::ffphis(fptr.as_raw(), text.as_ptr(), &mut status) };
-    check_status(status)?;
-    Ok(())
 }
 
 /// What the cube header is built from.
