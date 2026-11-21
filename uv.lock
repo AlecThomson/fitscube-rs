@@ -520,6 +520,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+compat = [
+    { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "astropy", version = "8.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 dev = [
     { name = "prek" },
     { name = "ty" },
@@ -552,6 +556,7 @@ docs = [
 
 [package.metadata]
 requires-dist = [
+    { name = "astropy", marker = "extra == 'compat'" },
     { name = "astropy", marker = "extra == 'test'" },
     { name = "fitscube", marker = "python_full_version >= '3.11' and extra == 'test'", specifier = ">=2.12.1" },
     { name = "fitscube", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2.10.0" },
@@ -562,7 +567,7 @@ requires-dist = [
     { name = "radio-beam", marker = "extra == 'test'" },
     { name = "ty", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev", "test"]
+provides-extras = ["compat", "dev", "test"]
 
 [package.metadata.requires-dev]
 docs = [
