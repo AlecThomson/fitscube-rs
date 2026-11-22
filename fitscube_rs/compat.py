@@ -34,8 +34,6 @@ from fitscube_rs import (
     ShapeMismatchException,
     StokesMismatchException,
     TargetAxisMissingException,
-    extract_common_bounding_box,
-    get_common_bounding_box,
 )
 from fitscube_rs import _fitscube_rs as _rs
 
@@ -171,6 +169,24 @@ def combine_fits(
         blank_zero_beams=blank_zero_beams,
     )
     return np.array(specs) * (u.s if time_domain_mode else u.Hz)
+
+
+def get_common_bounding_box(
+    file_list: list[Path],
+    invalidate_zeros: bool = False,
+    max_workers: int | None = None,
+) -> BoundingBox:
+    """The smallest box that holds the finite pixels of every image."""
+    return _rs.get_common_bounding_box(
+        file_list, invalidate_zeros=invalidate_zeros, max_workers=max_workers
+    )
+
+
+def extract_common_bounding_box(
+    bounding_boxes: list[BoundingBox | None],
+) -> BoundingBox:
+    """The smallest box that holds every given box; ``None`` entries are skipped."""
+    return _rs.extract_common_bounding_box(bounding_boxes)
 
 
 def even_spacing(specs: u.Quantity, time_domain_mode: bool = False) -> SpequencyInfo:

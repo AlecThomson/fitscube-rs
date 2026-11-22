@@ -47,6 +47,14 @@ def test_same_parameters(module, name):
         assert got[key].default == p.default, key
 
 
+@pytest.mark.parametrize("name", compat.__all__)
+def test_functions_are_python_functions(name):
+    """Prefect and other tools that wrap functions need plain Python ones."""
+    obj = getattr(compat, name)
+    if callable(obj) and not isinstance(obj, type):
+        assert inspect.isfunction(obj), name
+
+
 @pytest.mark.parametrize(
     "freqs",
     [
