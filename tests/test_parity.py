@@ -197,6 +197,14 @@ def test_varying_beams_beam_table(tmp_path):
         rs_units = [c.unit for c in rs_hdul["BEAMS"].columns]
         assert rs_units == [c.unit for c in ref_hdul["BEAMS"].columns]
         assert rs_units == ["arcsec", "arcsec", "deg", None, None]
+        # The beam-table comments, each on one card as fitscube writes them.
+        rs_comments = list(rs_hdul[0].header["COMMENT"])
+        for comment in (
+            "The PSF in each image plane varies.",
+            "Full beam information is stored in the second FITS extension.",
+            "The value '1.1754944e-38' represents a NaN PSF in the beamtable.",
+        ):
+            assert comment in rs_comments
 
 
 def _make_stokes_images(d: Path, freqs, beams, stokes_code: float) -> list[Path]:

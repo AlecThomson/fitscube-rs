@@ -516,7 +516,7 @@ impl CubeHeader<'_> {
             write_comment(
                 &mut fptr,
                 &format!(
-                    "The value '{}' represents a NaN PSF in the beamtable.",
+                    "The value '{:e}' represents a NaN PSF in the beamtable.",
                     f32::MIN_POSITIVE
                 ),
             )?;
