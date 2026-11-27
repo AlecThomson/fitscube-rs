@@ -79,19 +79,62 @@ def test_even_spacing_keeps_unit():
     assert len(rs.specs) == 4
 
 
-def test_even_spacing_times_keep_their_cadence():
-    """Times rounded to 0.1 s keep their 9.95 s cadence (fitscube issue #77).
+def _askap_times(steps: np.ndarray) -> np.ndarray:
+    """Start times of ASKAP integrations, in MJD seconds to 0.1 s as wsclean
+    writes DATE-OBS."""
+    return np.round(5.2597e9 + 9.95328 * np.asarray(steps), 1)
 
-    Checked against fixed values, as fitscube up to 2.12.1 puts these on a
-    ~1.1 s grid. Compare with ``fc_combine.even_spacing`` once a fitscube
-    release includes AlecThomson/fitscube#78.
-    """
-    cadence, missing = 9.95328, [100, 500, 501, *range(800, 810)]
-    times = np.round(np.delete(5.2597e9 + cadence * np.arange(1564), missing), 1)
+
+_RUN = np.arange(1564)
+_OFF_CADENCE = _askap_times(_RUN)
+_OFF_CADENCE[700] += 1.0
+
+# Times that grid, and to how many planes
+GRIDDED_TIMES = {
+    "rounded": (_askap_times(_RUN), 1564),
+    "rounded, 13 missing": (
+        _askap_times(np.delete(_RUN, [100, 500, 501, *range(800, 810)])),
+        1564,
+    ),
+    "long hole": (_askap_times(np.r_[0:50, 150:200]), 200),
+}
+REFUSED_TIMES = {
+    "1 s off the cadence": _OFF_CADENCE,
+    "gaps of 2 and 3 steps": 5.18e9 + np.array([0.0, 20.0, 50.0]),
+    "span beyond float64": np.array([-1e308, 1e308]),
+}
+
+# fitscube#78 (2.12.2) added number_gaps when it kept time grids at the cadence
+needs_time_grid_fix = pytest.mark.skipif(
+    not hasattr(fc_combine, "number_gaps"),
+    reason=f"fitscube {fitscube.__version__} puts imprecise times on a ~1 s grid",
+)
+
+
+@needs_time_grid_fix
+@pytest.mark.parametrize(
+    ("times", "planes"), list(GRIDDED_TIMES.values()), ids=list(GRIDDED_TIMES)
+)
+def test_even_spacing_times(times: np.ndarray, planes: int) -> None:
+    """Times rounded to 0.1 s keep their 9.95 s cadence (fitscube#77)."""
+    ref = fc_combine.even_spacing(times * u.s, time_domain_mode=True)
     rs = compat.even_spacing(times * u.s, time_domain_mode=True)
-    assert len(rs.specs) == 1564
-    assert np.flatnonzero(rs.missing_chan_idx).tolist() == missing
-    np.testing.assert_allclose(np.diff(rs.specs.to_value(u.s)), cadence, atol=1e-3)
+    assert len(ref.specs) == len(rs.specs) == planes
+    np.testing.assert_array_equal(rs.missing_chan_idx, ref.missing_chan_idx)
+    np.testing.assert_allclose(rs.specs.value, ref.specs.value, rtol=1e-15, atol=0)
+
+
+@needs_time_grid_fix
+@pytest.mark.parametrize("times", list(REFUSED_TIMES.values()), ids=list(REFUSED_TIMES))
+def test_even_spacing_refused_times(times: np.ndarray) -> None:
+    """Times off a single cadence are refused, not put on a finer grid."""
+    with (
+        np.errstate(over="ignore"),
+        pytest.raises(fc_exceptions.IrregularSpacingException),
+    ):
+        fc_combine.even_spacing(times * u.s, time_domain_mode=True)
+    with pytest.raises(compat.IrregularSpacingException):
+        compat.even_spacing(times * u.s, time_domain_mode=True)
 
 
 def test_even_spacing_irregular_raises():
