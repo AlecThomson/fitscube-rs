@@ -79,6 +79,21 @@ def test_even_spacing_keeps_unit():
     assert len(rs.specs) == 4
 
 
+def test_even_spacing_times_keep_their_cadence():
+    """Times rounded to 0.1 s keep their 9.95 s cadence (fitscube issue #77).
+
+    Checked against fixed values, as fitscube up to 2.12.1 puts these on a
+    ~1.1 s grid. Compare with ``fc_combine.even_spacing`` once a fitscube
+    release includes AlecThomson/fitscube#78.
+    """
+    cadence, missing = 9.95328, [100, 500, 501, *range(800, 810)]
+    times = np.round(np.delete(5.2597e9 + cadence * np.arange(1564), missing), 1)
+    rs = compat.even_spacing(times * u.s, time_domain_mode=True)
+    assert len(rs.specs) == 1564
+    assert np.flatnonzero(rs.missing_chan_idx).tolist() == missing
+    np.testing.assert_allclose(np.diff(rs.specs.to_value(u.s)), cadence, atol=1e-3)
+
+
 def test_even_spacing_irregular_raises():
     specs = np.array([1.0e9, 1.0e9 + np.pi, 1.0e9 + 1e7]) * u.Hz
     with pytest.raises(fc_exceptions.IrregularSpacingException):
