@@ -9,7 +9,7 @@ The tables below are written by `scripts/update_performance.py`, which the
 runners are noisy, so trust the ratios more than the absolute times.
 
 <!-- benchmark:machine -->
-Measured 2026-10-18 on AMD EPYC 7763 64-Core Processor (4 cores), 16 GB RAM, Linux. `fitscube-rs` v2.1.0-1-g192eb8f, `fitscube` 2.11.0, `astropy` 8.0.0, `numpy` 2.4.6, `fpack` 4.070 (CFITSIO).
+Measured 2026-11-28 on Intel(R) Xeon(R) 6975P-C (4 cores), 16 GB RAM, Linux. `fitscube-rs` v2.5.0, `fitscube` 2.12.2, `astropy` 8.0.0, `numpy` 2.4.6, `fpack` 4.070 (CFITSIO).
 <!-- /benchmark:machine -->
 
 To refresh them locally:
@@ -31,13 +31,13 @@ python scripts/benchmark.py --nchan 100 --size 256 --repeat 3
 <!-- benchmark:api -->
 | Channels × image | Cube size | `fitscube` (py) | `fitscube-rs` | Speedup |
 | ---------------- | --------: | --------------: | ------------: | ------: |
-| 50 × 128² | 3 MB | 0.397 s | 0.004 s | 96× |
-| 100 × 256² | 26 MB | 0.754 s | 0.015 s | 52× |
-| 100 × 512² | 105 MB | 0.762 s | 0.038 s | 20× |
-| 200 × 256² | 52 MB | 1.464 s | 0.026 s | 57× |
-| 500 × 256² | 131 MB | 3.607 s | 0.066 s | 54× |
-| 1000 × 128² | 66 MB | 7.206 s | 0.070 s | 102× |
-| 100 × 1024² | 419 MB | 0.827 s | 0.137 s | 6.1× |
+| 50 × 128² | 3 MB | 0.246 s | 0.002 s | 117× |
+| 100 × 256² | 26 MB | 0.462 s | 0.010 s | 47× |
+| 100 × 512² | 105 MB | 0.474 s | 0.030 s | 16× |
+| 200 × 256² | 52 MB | 0.887 s | 0.019 s | 47× |
+| 500 × 256² | 131 MB | 2.202 s | 0.044 s | 50× |
+| 1000 × 128² | 66 MB | 4.350 s | 0.036 s | 123× |
+| 100 × 1024² | 419 MB | 0.568 s | 0.110 s | 5.2× |
 <!-- /benchmark:api -->
 
 ## Command line
@@ -56,13 +56,13 @@ python scripts/benchmark_cli.py /scratch --nchan 100 --size 1024
 <!-- benchmark:cli-100x1024 -->
 | Command | `fitscube` | `fitscubers` | `fpack` |
 | ------- | ---------: | -----------: | ------: |
-| `combine` | 1.66 s, 287 MB | 0.16 s, 62 MB |  |
-| `combine --bounding-box` | 2.00 s, 503 MB | 0.18 s, 49 MB |  |
-| `extract` | 0.83 s, 117 MB | 0.01 s, 10 MB |  |
-| `compress tile-gzip` | 7.47 s, 186 MB | 3.45 s, 62 MB | 13.07 s |
-| `decompress` (tile-gzip) | 3.17 s, 120 MB | 0.80 s, 26 MB |  |
-| `compress tile-rice` | 3.36 s, 159 MB | 1.24 s, 57 MB | 4.01 s |
-| `decompress` (tile-rice) | 2.48 s, 121 MB | 0.80 s, 24 MB |  |
+| `combine` | 1.15 s, 305 MB | 0.13 s, 62 MB |  |
+| `combine --bounding-box` | 1.39 s, 521 MB | 0.14 s, 49 MB |  |
+| `extract` | 0.59 s, 134 MB | 0.01 s, — |  |
+| `compress tile-gzip` | 6.37 s, 188 MB | 2.62 s, 32 MB | 7.78 s |
+| `decompress` (tile-gzip) | 2.52 s, 138 MB | 1.40 s, 25 MB |  |
+| `compress tile-rice` | 2.47 s, 185 MB | 1.04 s, 31 MB | 2.96 s |
+| `decompress` (tile-rice) | 1.98 s, 138 MB | 1.40 s, 24 MB |  |
 <!-- /benchmark:cli-100x1024 -->
 
 1000 × 128² `float32` (66 MB cube), where fitscube's per-plane overhead
@@ -71,13 +71,13 @@ shows:
 <!-- benchmark:cli-1000x128 -->
 | Command | `fitscube` | `fitscubers` | `fpack` |
 | ------- | ---------: | -----------: | ------: |
-| `combine` | 8.04 s, 132 MB | 0.09 s, 10 MB |  |
-| `combine --bounding-box` | 9.31 s, 195 MB | 0.12 s, 10 MB |  |
-| `extract` | 0.84 s, 111 MB | 0.01 s, — |  |
-| `compress tile-gzip` | 1.58 s, 114 MB | 0.42 s, 18 MB | 8.05 s |
-| `decompress` (tile-gzip) | 1.92 s, 112 MB | 0.10 s, 8 MB |  |
-| `compress tile-rice` | 14.02 s, 114 MB | 0.22 s, 15 MB | 0.73 s |
-| `decompress` (tile-rice) | 1.70 s, 112 MB | 0.07 s, 8 MB |  |
+| `combine` | 4.76 s, 151 MB | 0.04 s, 10 MB |  |
+| `combine --bounding-box` | 5.53 s, 213 MB | 0.05 s, 10 MB |  |
+| `extract` | 0.60 s, 128 MB | 0.01 s, — |  |
+| `compress tile-gzip` | 1.18 s, 131 MB | 0.30 s, 19 MB | 5.03 s |
+| `decompress` (tile-gzip) | 1.33 s, 129 MB | 0.09 s, 9 MB |  |
+| `compress tile-rice` | 9.12 s, 131 MB | 0.18 s, 16 MB | 0.52 s |
+| `decompress` (tile-rice) | 1.17 s, 129 MB | 0.05 s, 9 MB |  |
 <!-- /benchmark:cli-1000x128 -->
 
 On a 415 MB cube with sky structure, `tile-gzip` gives 147 MB in either tool,
