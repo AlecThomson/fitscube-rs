@@ -184,7 +184,8 @@ def even_spacing(specs: typing.Sequence[builtins.float], time_domain_mode: built
     
     Raises:
         IrregularSpacingException: If no grid of at most 1000 points per input
-            holds every input.
+            holds every input, or for times, none whose step is their
+            smallest gap.
         ValueError: If a value is not finite.
     """
 

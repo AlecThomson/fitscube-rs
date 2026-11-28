@@ -51,10 +51,21 @@ the headers. NaN or infinite values are an error.
 
 With `--create-blanks`, fitscube-rs builds a regular grid through the sorted
 values instead, and fills the grid points that have no input with NaN planes.
-The step divides the smallest gap, so it tries that gap over 1, 2, 3... and
-fits each step to every input, keeping the first that puts every input within
-about 1 Hz at 1 GHz (0.5 s for times) of a grid point. Images of uneven width,
-or either side of a gap between bands, still make one cube.
+For frequencies, the step divides the smallest gap, so it tries that gap over
+1, 2, 3... and keeps the first step that puts every input within about 1 Hz at
+1 GHz of a grid point. Images of uneven width, or either side of a gap between
+bands, still make one cube.
+
+For times, the step is always the cadence. Time-step images come from a regular
+cadence, and a finer step would let almost any set of times fit within the
+0.5 s tolerance. The step starts from the mean of the one-step gaps, since
+wsclean writes `DATE-OBS` to 0.1 s and the smallest gap can come out short.
+Times that do not sit on that grid are refused.
+
+For both, each input's plane comes from adding up its gaps to the one before,
+each rounded to a whole number of steps, so an error in the step does not build
+up along a long run. A line fitted through every input then refines the step,
+and the inputs are renumbered with it until their planes stop changing.
 
 An input that is on the grid only within that tolerance is kept with a warning,
 and `CSYERi` (the FITS systematic error of the axis) records the largest offset,

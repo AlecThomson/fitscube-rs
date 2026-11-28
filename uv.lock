@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -494,7 +494,7 @@ wheels = [
 
 [[package]]
 name = "fitscube"
-version = "2.12.1"
+version = "2.12.2"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -506,9 +506,9 @@ dependencies = [
     { name = "radio-beam" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/4e/ff/a13e0a2703655fb65d7eee06789476984dea25dacb32126e0cc8ce72f109/fitscube-2.12.1.tar.gz", hash = "sha256:0db8a97726277e74b3c33d9ead68dc98d72d27cc190a0b043dfdd1e679948d6c", size = 797927, upload-time = "2026-11-21T10:28:41.049Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/f7/0eaf8500f19add3af1a80906342c946e8fd49f0e05ce9d4e078cf28287f0/fitscube-2.12.2.tar.gz", hash = "sha256:e83b4cbbc630c88a7f2bcaf1a350aee5a175e7d8ebac7c4b47edbe003563f70e", size = 799687, upload-time = "2026-11-27T07:50:58.014Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/07/fb/3d675420800a26f41b33bac900387919d7a9dc4c84dc421f02b1d02b6e88/fitscube-2.12.1-py3-none-any.whl", hash = "sha256:a89077e06660e96a426e6a313b0e77870dcb75b15fe5cfd220608e8419091c4a", size = 44138, upload-time = "2026-11-21T10:28:39.473Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/06/71bb223b170931caefbf8645b974aee2dcb96b788ee8d6428cff738be289/fitscube-2.12.2-py3-none-any.whl", hash = "sha256:7c0835b44bdfcde03050e19068377083213f15468c94dff84eca4212eb80dc02", size = 45116, upload-time = "2026-11-27T07:50:56.815Z" },
 ]
 
 [[package]]
@@ -532,7 +532,7 @@ test = [
     { name = "astropy", version = "6.1.7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "astropy", version = "8.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "fitscube", version = "2.10.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "fitscube", version = "2.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "fitscube", version = "2.12.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pytest" },
@@ -558,7 +558,7 @@ docs = [
 requires-dist = [
     { name = "astropy", marker = "extra == 'compat'" },
     { name = "astropy", marker = "extra == 'test'" },
-    { name = "fitscube", marker = "python_full_version >= '3.11' and extra == 'test'", specifier = ">=2.12.1" },
+    { name = "fitscube", marker = "python_full_version >= '3.11' and extra == 'test'", specifier = ">=2.12.2" },
     { name = "fitscube", marker = "python_full_version < '3.11' and extra == 'test'", specifier = ">=2.10.0" },
     { name = "numpy" },
     { name = "numpy", marker = "extra == 'test'" },

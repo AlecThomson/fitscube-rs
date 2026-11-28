@@ -59,38 +59,99 @@ struct GridFit {
     residuals: Vec<f64>,
 }
 
+/// Grid point of each value, from the gaps between them.
+///
+/// Each gap is rounded to a whole number of steps, and at least one, as
+/// distinct values need planes of their own. Adding up rounded gaps, rather
+/// than rounding each value's offset from the first, keeps an error in the
+/// step from building up along the span. Ties round to even, as numpy does.
+fn number_gaps(gaps: &[f64], step: f64) -> Vec<f64> {
+    std::iter::once(0.0)
+        .chain(gaps.iter().scan(0.0, |point, &gap| {
+            *point += (gap / step).round_ties_even().max(1.0);
+            Some(*point)
+        }))
+        .collect()
+}
+
+/// Least-squares line `offset = start + step * index`, as `(step, start)`.
+fn fit_line(index: &[f64], offsets: &[f64]) -> (f64, f64) {
+    let n = index.len() as f64;
+    let mean_i = index.iter().sum::<f64>() / n;
+    let mean_o = offsets.iter().sum::<f64>() / n;
+    let (mut sxy, mut sxx) = (0.0, 0.0);
+    for (&i, &o) in index.iter().zip(offsets) {
+        sxy += (i - mean_i) * (o - mean_o);
+        sxx += (i - mean_i) * (i - mean_i);
+    }
+    let step = sxy / sxx;
+    (step, mean_o - step * mean_i)
+}
+
 /// The widest regular grid that holds every sorted, distinct value, or `None`
 /// if no grid of at most 1000 points per value does.
 ///
-/// The step divides the smallest gap, so steps of that gap over 1, 2, 3... are
-/// tried in turn. Each is fitted to all the values, and the first that puts
-/// every value on a grid point within the match tolerance wins.
+/// For frequencies the step divides the smallest gap, so steps of that gap
+/// over 1, 2, 3... are tried in turn. Times come from a regular cadence, so for
+/// them only the smallest gap itself is tried: a finer step would let almost
+/// any set of times sit within the ~0.5 s match tolerance. The time step starts
+/// from the mean of the gaps of one step, which time stamps rounded to 0.1 s
+/// (as wsclean writes DATE-OBS) leave far closer to the cadence than the
+/// smallest gap.
+///
+/// For each step, the values are numbered from their gaps (see
+/// [`number_gaps`]) and a line is fitted through them, which gives a more
+/// accurate step. The gaps are renumbered with that step and refitted until the
+/// numbering settles. The first step that then puts every value on its grid
+/// point, within the match tolerance, wins.
 fn fit_grid(specs: &[f64], time_domain_mode: bool) -> Option<GridFit> {
     let offsets: Vec<f64> = specs.iter().map(|&v| v - specs[0]).collect();
     let span = offsets[offsets.len() - 1];
-    let min_gap = specs
-        .windows(2)
-        .map(|w| w[1] - w[0])
-        .fold(f64::INFINITY, f64::min);
+    // Values too far apart for f64 make the span and the smallest gap both
+    // infinite, and their ratio NaN, which the size check below lets through
+    if !span.is_finite() {
+        return None;
+    }
+    let gaps: Vec<f64> = specs.windows(2).map(|w| w[1] - w[0]).collect();
+    let min_gap = gaps.iter().copied().fold(f64::INFINITY, f64::min);
     let max_channels = 1000.0 * specs.len() as f64;
-    let n = specs.len() as f64;
-
-    let mut divisor = 1.0;
-    while span * divisor / min_gap < max_channels {
-        let index: Vec<f64> = offsets
+    // A first step only a little short of the cadence still misnumbers a long
+    // gap. The mean is kept to times: frequency gaps of, say, 3 and 4 steps
+    // would average to a step that is not one of theirs.
+    let first_step = if time_domain_mode {
+        let one_step: Vec<f64> = gaps
             .iter()
-            .map(|&o| (o * divisor / min_gap).round())
+            .copied()
+            .filter(|&g| g < 1.5 * min_gap)
             .collect();
-        // Least-squares line through (index, offset)
-        let mean_i = index.iter().sum::<f64>() / n;
-        let mean_o = offsets.iter().sum::<f64>() / n;
-        let (mut sxy, mut sxx) = (0.0, 0.0);
-        for (&i, &o) in index.iter().zip(&offsets) {
-            sxy += (i - mean_i) * (o - mean_o);
-            sxx += (i - mean_i) * (i - mean_i);
+        one_step.iter().sum::<f64>() / one_step.len() as f64
+    } else {
+        min_gap
+    };
+    let max_divisor = if time_domain_mode { 1 } else { u32::MAX };
+
+    for divisor in (1..=max_divisor).map(f64::from) {
+        if span * divisor / min_gap >= max_channels {
+            break;
         }
-        let step = sxy / sxx;
-        let start = mean_o - step * mean_i;
+        let mut index = number_gaps(&gaps, first_step / divisor);
+        let (mut step, mut start) = (f64::NAN, f64::NAN);
+        let mut settled = false;
+        for _ in 0..5 {
+            // Usually settles in one or two passes
+            (step, start) = fit_line(&index, &offsets);
+            let renumbered = number_gaps(&gaps, step);
+            settled = renumbered == index;
+            if settled {
+                break;
+            }
+            index = renumbered;
+        }
+        // A refit could grow the grid past the size the search is bounded by
+        if !settled || index[index.len() - 1] >= max_channels {
+            continue;
+        }
+
         let residuals: Vec<f64> = index
             .iter()
             .zip(&offsets)
@@ -108,7 +169,6 @@ fn fit_grid(specs: &[f64], time_domain_mode: bool) -> Option<GridFit> {
                 residuals,
             });
         }
-        divisor += 1.0;
     }
     None
 }
@@ -116,8 +176,9 @@ fn fit_grid(specs: &[f64], time_domain_mode: bool) -> Option<GridFit> {
 /// Put `specs` on a regular grid and flag the grid points with no input.
 ///
 /// Returns [`FitsCubeError::IrregularSpacing`] if no grid of at most 1000
-/// points per input holds every input. Inputs that sit on the grid only within
-/// the match tolerance are kept, with a warning.
+/// points per input holds every input, or for times, none whose step is their
+/// smallest gap. Inputs that sit on the grid only within the match tolerance
+/// are kept, with a warning.
 pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, Vec<bool>)> {
     check_finite(specs)?;
     let mut sorted = specs.to_vec();
@@ -137,10 +198,15 @@ pub fn even_spacing(specs: &[f64], time_domain_mode: bool) -> Result<(Vec<f64>, 
         .then(|| fit_grid(&sorted, time_domain_mode))
         .flatten()
     else {
+        let step = if time_domain_mode {
+            ", with a step of their smallest gap,"
+        } else {
+            ""
+        };
         return Err(FitsCubeError::IrregularSpacing(format!(
-            "No regular grid of at most {} points holds all {} {spequencies}, so blank \
-             channels would drop inputs. Combine without blank channels, or regrid the \
-             inputs onto a common step.",
+            "No regular grid of at most {} points{step} holds all {} {spequencies}, so \
+             blank channels would drop inputs. Combine without blank channels, or regrid \
+             the inputs onto a common step.",
             1000 * sorted.len(),
             sorted.len()
         )));
@@ -447,6 +513,150 @@ mod tests {
     fn huge_grids_are_refused() {
         let err = even_spacing(&[0.0, 1.0, 1e9], false).unwrap_err();
         assert!(matches!(err, FitsCubeError::IrregularSpacing(_)), "{err:?}");
+    }
+
+    /// Two values whose gap overflows f64 made the size check NaN, and the
+    /// frequency search ran through every divisor.
+    #[test]
+    fn spans_beyond_f64_are_refused() {
+        for time_domain_mode in [false, true] {
+            let err = even_spacing(&[-1e308, 1e308], time_domain_mode).unwrap_err();
+            assert!(matches!(err, FitsCubeError::IrregularSpacing(_)), "{err:?}");
+        }
+    }
+
+    /// ASKAP's cycle time, in seconds.
+    const ASKAP_CADENCE: f64 = 9.95328;
+
+    /// Start times of the ASKAP integrations `steps`, in MJD seconds.
+    fn askap_times(steps: impl IntoIterator<Item = usize>) -> Vec<f64> {
+        steps
+            .into_iter()
+            .map(|i| 5.2597e9 + ASKAP_CADENCE * i as f64)
+            .collect()
+    }
+
+    /// Times rounded to 0.1 s, as wsclean writes DATE-OBS.
+    fn round_to_tenth(times: &mut [f64]) {
+        for t in times {
+            *t = (*t * 10.0).round_ties_even() / 10.0;
+        }
+    }
+
+    /// Uniform offsets in `[-amplitude, amplitude)`, the same on every run.
+    fn jitter(times: &mut [f64], amplitude: f64) {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for t in times {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+            *t += amplitude * (2.0 * unit - 1.0);
+        }
+    }
+
+    fn missing_indices(missing: &[bool]) -> Vec<usize> {
+        (0..missing.len()).filter(|&i| missing[i]).collect()
+    }
+
+    /// Times a little off a long cadence were put on a ~1 s grid (fitscube
+    /// issue #77). Rounded to 0.1 s, the smallest gap was 9.9 s rather than
+    /// 9.953 s, and numbering every time against it drifted by a whole step
+    /// along the run. The ten missing in a row check a long gap is numbered
+    /// right.
+    #[test]
+    fn imprecise_times_keep_their_cadence() {
+        let missing: Vec<usize> = [100, 500, 501].into_iter().chain(800..810).collect();
+        let kept = (0..1564).filter(|i| !missing.contains(i));
+        for perturb in [round_to_tenth as fn(&mut [f64]), |t| jitter(t, 0.3)] {
+            let mut times = askap_times(kept.clone());
+            perturb(&mut times);
+
+            let (new, flagged) = even_spacing(&times, true).unwrap();
+
+            assert_eq!(new.len(), 1564);
+            assert_eq!(missing_indices(&flagged), missing);
+            for w in new.windows(2) {
+                assert_relative_eq!(w[1] - w[0], ASKAP_CADENCE, epsilon = 1e-3);
+            }
+        }
+    }
+
+    /// Numbering from the 9.9 s smallest gap settled on one step too many.
+    #[test]
+    fn long_hole_between_short_runs() {
+        let mut times = askap_times((0..50).chain(150..200));
+        round_to_tenth(&mut times);
+
+        let (new, missing) = even_spacing(&times, true).unwrap();
+
+        assert_eq!(new.len(), 200);
+        assert_eq!(missing_indices(&missing), (50..150).collect::<Vec<_>>());
+    }
+
+    /// Rounded times at ASKAP integrations `steps` land on exactly those planes.
+    fn assert_on_their_steps(steps: &[usize]) {
+        let mut times = askap_times(steps.iter().copied());
+        round_to_tenth(&mut times);
+
+        let (new, missing) = even_spacing(&times, true).unwrap();
+
+        assert_eq!(new.len(), steps[steps.len() - 1] + 1);
+        let present: Vec<usize> = (0..missing.len()).filter(|&i| !missing[i]).collect();
+        assert_eq!(present, steps);
+    }
+
+    /// With one one-step gap, rounded to 10.0 s, the first step is 0.5% long.
+    /// Numbering each time by its offset from the first drifts by a step along
+    /// the run; adding up the gaps, each 3 steps, does not.
+    #[test]
+    fn gaps_are_numbered_one_at_a_time() {
+        let steps: Vec<usize> = std::iter::once(0)
+            .chain((0..500).map(|k| 1 + 3 * k))
+            .collect();
+        assert_on_their_steps(&steps);
+    }
+
+    /// The same 10.0 s first step numbers a 150-step hole as 149 steps. The
+    /// refit, with the step from every time, renumbers it.
+    #[test]
+    fn refit_renumbers_a_long_hole() {
+        let steps: Vec<usize> = std::iter::once(0)
+            .chain((0..300).map(|k| 1 + 3 * k))
+            .chain((0..=50).map(|k| 1048 + 3 * k))
+            .collect();
+        assert_on_their_steps(&steps);
+    }
+
+    /// An image 1 s off the cadence put the run on a ~1 s grid, 90% blank.
+    #[test]
+    fn time_off_the_cadence_is_refused() {
+        let mut times = askap_times(0..1564);
+        round_to_tenth(&mut times);
+        times[700] += 1.0;
+
+        let err = even_spacing(&times, true).unwrap_err();
+        assert!(
+            matches!(&err, FitsCubeError::IrregularSpacing(msg) if msg.contains("smallest gap")),
+            "{err:?}"
+        );
+    }
+
+    /// Frequencies 2 and 3 steps apart are gridded, but times must share a
+    /// cadence.
+    #[test]
+    fn times_are_not_split_below_their_smallest_gap() {
+        let offsets = [0.0, 20.0, 50.0];
+        let freqs: Vec<f64> = offsets.iter().map(|o| 1e9 + o * 1e6).collect();
+        let (new, _) = even_spacing(&freqs, false).unwrap();
+        assert_eq!(new.len(), 6);
+
+        let times: Vec<f64> = offsets.iter().map(|o| 5.18e9 + o).collect();
+        let err = even_spacing(&times, true).unwrap_err();
+        assert!(
+            matches!(&err, FitsCubeError::IrregularSpacing(msg) if msg.contains("smallest gap")),
+            "{err:?}"
+        );
     }
 
     #[test]
